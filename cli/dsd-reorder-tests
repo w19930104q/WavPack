@@ -1,0 +1,376 @@
+#!/usr/bin/env python3
+"""Acceptance tests for --channel-order on DSDIFF (.dff) and DSF (.dsf) input.
+
+Run with:
+    python3 -I cli/dsd-reorder-tests \
+        --wavpack <path/to/new/wavpack> \
+        --wvunpack <path/to/new/wvunpack> \
+        [--baseline-wavpack <path>] [--baseline-wvunpack <path>] \
+        [--datadir <dir with stereo.dff/dsf sixch.dff/dsf>]
+
+If --datadir is omitted, fixed-sample DSD files are generated into a
+temporary directory using cli/dsd-reorder-gen-samples (kept beside this
+script). When baseline binaries are supplied, the default (no --channel-order)
+path is additionally asserted byte-for-byte identical to the baseline.
+
+Checks:
+  A. 2ch and 6ch fixed-sample DSD files, several permutations each, encoded
+     and decoded back; the DSD audio payload is asserted byte-for-byte equal
+     to the expected permutation of the source payload (and the inverse
+     permutation restores the original exactly).
+  B. Without --channel-order, new binaries produce byte-identical .wv files
+     and decoded output versus the baseline binaries (when provided).
+  C. Repeated/unknown channel specs and count mismatches still fail.
+  D. A real permutation discards the source wrapper; an identity order keeps
+     it, so the default path is unchanged.
+"""
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+
+# permutations expressed as output-position -> source-position channel index,
+# in the same notation as the --channel-order speaker lists below
+STEREO_PERMS = [
+    ("identity", ["FL", "FR"]),
+    ("swap",     ["FR", "FL"]),
+    ("swap-dsd", ["SRGT", "SLFT"]),
+]
+
+# source 6ch order (both files): FL,FR,FC,BL,BR,BC
+SIXCH_PERMS = [
+    ("identity",  ["FL", "FR", "FC", "BL", "BR", "BC"]),
+    ("reverse",   ["BC", "BR", "BL", "FC", "FR", "FL"]),
+    ("rotate",    ["FR", "FC", "BL", "BR", "BC", "FL"]),
+    # DSDIFF spellings for five of the speakers; BC (bit 8) has no DSDIFF
+    # label in the accepted set so it stays in PCM spelling to keep the set
+    # equal to the source mask {FL,FR,FC,BL,BR,BC}
+    ("dsd-names", ["MRGT", "C", "LS", "RS", "BC", "MLFT"]),
+]
+
+
+def run(cmd):
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    return p.returncode, p.stdout.decode("utf-8", "replace")
+
+
+def expect_fail(cmd, needle):
+    rc, out = run(cmd)
+    assert rc != 0, f"expected failure but succeeded: {' '.join(cmd)}"
+    assert needle in out, f"expected {needle!r} in output:\n{out}"
+
+
+def extract_dsd_audio_dff(path):
+    """Return the raw DSD payload (interleaved channel bytes) of a DFF."""
+    with open(path, "rb") as f:
+        data = f.read()
+    pos = 16  # FRM8 header (12) + formType "DSD " (4)
+    while pos + 12 <= len(data):
+        cid = data[pos:pos + 4]
+        size = int.from_bytes(data[pos + 4:pos + 12], "big")
+        body = pos + 12
+        if cid == b"DSD ":
+            return data[body:body + size]
+        pos = body + size + (size & 1)
+    raise AssertionError("no DSD chunk in " + path)
+
+
+def extract_dsd_audio_dsf(path, num_channels):
+    """Return DSF audio as per-block, per-channel byte stream (block layout)."""
+    with open(path, "rb") as f:
+        data = f.read()
+    p = 28
+    assert data[p:p + 4] == b"fmt "
+    # fmt chunk: 4s ckID, q ckSize, then at p+12: I ver, I fmtID, I chanType,
+    # I numChannels, I sampleRate, I bitsPerSample, q sampleCount,
+    # I blockSize, 4s reserved
+    num_channels = int.from_bytes(data[p + 24:p + 28], "little")
+    sample_count = int.from_bytes(data[p + 36:p + 44], "little")
+    block_size = int.from_bytes(data[p + 44:p + 48], "little")
+    p += 52
+    assert data[p:p + 4] == b"data"
+    data_len = int.from_bytes(data[p + 4:p + 12], "little")
+    audio_len = data_len - 12
+    audio = data[p + 12:p + 12 + audio_len]
+    total_blocks = (sample_count + block_size * 8 - 1) // (block_size * 8)
+    assert audio_len == total_blocks * block_size * num_channels
+    return audio, block_size, total_blocks
+
+
+def permute_interleaved(audio, num_channels, order):
+    """audio: interleaved [s0c0,s0c1,...]. order[out_c] = src_c."""
+    out = bytearray(len(audio))
+    frame = num_channels
+    for off in range(0, len(audio), frame):
+        for out_c, src_c in enumerate(order):
+            out[off + out_c] = audio[off + src_c]
+    return bytes(out)
+
+
+def permute_blocked(audio, num_channels, block_size, total_blocks, order):
+    """DSF layout: for each block, channel 0 block, channel 1 block, ..."""
+    out = bytearray(len(audio))
+    chunk = block_size
+    for b in range(total_blocks):
+        base = b * chunk * num_channels
+        for out_c, src_c in enumerate(order):
+            out[base + out_c * chunk:base + (out_c + 1) * chunk] = \
+                audio[base + src_c * chunk:base + (src_c + 1) * chunk]
+    return bytes(out)
+
+
+def speaker_order_to_indices(spec):
+    speakers = ["FL", "FR", "FC", "LFE", "BL", "BR", "FLC", "FRC", "BC",
+                "SL", "SR", "TC", "TFL", "TFC", "TFR", "TBL", "TBC", "TBR"]
+    dsd = {"SLFT": "FL", "SRGT": "FR", "MLFT": "FL", "MRGT": "FR",
+           "C": "FC", "LFE": "LFE", "LS": "BL", "RS": "BR"}
+    resolved = [dsd.get(s, s) for s in spec]
+    return [speakers.index(s) for s in resolved]
+
+
+def compress_order(channel_order, n):
+    """Mirror wavpack.c: map sparse speaker-bit indices onto 0..n-1 while
+    preserving the permutation semantics (output position c takes the source
+    channel that originally held the speaker now assigned to position c)."""
+    new = list(range(n))
+    new[:len(channel_order)] = list(channel_order)
+    i = 0
+    while i < len(channel_order):
+        for j in range(len(channel_order)):
+            if new[j] == i:
+                i += 1
+                break
+        else:
+            for j in range(len(channel_order)):
+                if new[j] > i:
+                    new[j] -= 1
+    return new
+
+
+def physical_permutation(spec, n):
+    """Return p where output[p[src]] = source channel src, matching the
+    order[] consumed by reorder_channels() in the encoder."""
+    order = compress_order(speaker_order_to_indices(spec), n)
+    return order
+
+
+def expected_dst_from_order(order):
+    """Given encoder order[src]=dst, return dst_frame[c] = source channel
+    index that ends up at output position c (the inverse permutation)."""
+    inv = [0] * len(order)
+    for src, dst in enumerate(order):
+        inv[dst] = src
+    return inv
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--wavpack", required=True)
+    ap.add_argument("--wvunpack", required=True)
+    ap.add_argument("--baseline-wavpack")
+    ap.add_argument("--baseline-wvunpack")
+    ap.add_argument("--datadir",
+                    help="directory with stereo/sixch .dff/.dsf; generated if omitted")
+    args = ap.parse_args()
+
+    failures = []
+    generated_dir = None
+
+    if not args.datadir:
+        generator = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "dsd-reorder-gen-samples")
+        generated_dir = tempfile.mkdtemp(prefix="dsd-samples-")
+        rc, out = run([sys.executable, "-I", generator, generated_dir])
+        assert rc == 0, f"sample generation failed:\n{out}"
+        args.datadir = generated_dir
+
+    def check(name, fn):
+        try:
+            fn()
+            print(f"PASS  {name}")
+        except AssertionError as e:
+            failures.append((name, str(e)))
+            print(f"FAIL  {name}: {e}")
+
+    tmp = tempfile.mkdtemp(prefix="dsd-reorder-")
+
+    cases = [
+        ("stereo.dff", 2, STEREO_PERMS, "dff", False),
+        ("stereo.dsf", 2, STEREO_PERMS, "dsf", True),
+        ("sixch.dff", 6, SIXCH_PERMS, "dff", False),
+        ("sixch.dsf", 6, SIXCH_PERMS, "dsf", True),
+    ]
+
+    for fname, nch, perms, ext, blocked in cases:
+        src = os.path.join(args.datadir, fname)
+
+        for label, spec in perms:
+            def t(src=src, nch=nch, spec=spec, ext=ext, blocked=blocked,
+                  label=label, fname=fname):
+                wv = os.path.join(tmp, f"{fname}.{label}.wv")
+                rc, out = run([args.wavpack, "-y",
+                               "--channel-order=" + ",".join(spec),
+                               src, "-o", wv])
+                assert rc == 0, out
+                rc, out = run([args.wvunpack, "-y", "-o", tmp + os.sep, wv])
+                assert rc == 0, out
+                # wvunpack strips the final ".wv" and appends "." + format ext
+                produced = os.path.join(tmp,
+                    os.path.basename(wv)[:-3] + "." + ext)
+                assert os.path.exists(produced), f"missing decoded {produced}"
+
+                # encoder order[] is order[src]=dst; invert to get the
+                # output-position -> source-channel map used by the permuters
+                order = expected_dst_from_order(
+                    physical_permutation(spec, nch))
+                if not blocked:
+                    src_audio = extract_dsd_audio_dff(src)
+                    dec_audio = extract_dsd_audio_dff(produced)
+                    expected = permute_interleaved(src_audio, nch, order)
+                    assert dec_audio == expected, (
+                        "DFF DSD payload mismatch after reorder")
+                else:
+                    src_audio, bs, nb = extract_dsd_audio_dsf(src, nch)
+                    dec_audio, dbs, dnb = extract_dsd_audio_dsf(produced, nch)
+                    assert (bs, nb) == (dbs, dnb)
+                    expected = permute_blocked(src_audio, nch, bs, nb, order)
+                    assert dec_audio == expected, (
+                        "DSF DSD payload mismatch after reorder")
+            check(f"reorder {fname} {label}", t)
+
+        # inverse permutation must restore the original payload byte-for-byte.
+        # Specs stay within each file's actual speaker set. On the 6ch files
+        # (FL,FR,FC,BL,BR,BC) fwd swaps the two fronts and inv swaps them back;
+        # both are self-inverse swaps, so applying the same spec twice restores
+        # the source exactly.
+        inverse_specs = {
+            2: (["FR", "FL"], ["FR", "FL"]),
+            6: (["FR", "FL", "FC", "BL", "BR", "BC"],
+                ["FR", "FL", "FC", "BL", "BR", "BC"]),
+        }
+
+        def inverse_t(src=src, nch=nch, ext=ext, blocked=blocked, fname=fname):
+            fwd, inv = inverse_specs[nch]
+            wv1 = os.path.join(tmp, fname + ".fwd.wv")
+            rc, out = run([args.wavpack, "-y",
+                           "--channel-order=" + ",".join(fwd), src, "-o", wv1])
+            assert rc == 0, out
+            mid = os.path.join(tmp, fname + ".fwd." + ext)
+            rc, out = run([args.wvunpack, "-y", "-o", tmp + os.sep, wv1])
+            assert rc == 0, out
+            assert os.path.exists(mid), f"missing intermediate {mid}"
+            wv2 = os.path.join(tmp, fname + ".inv.wv")
+            rc, out = run([args.wavpack, "-y",
+                           "--channel-order=" + ",".join(inv),
+                           mid, "-o", wv2])
+            assert rc == 0, out
+            rc, out = run([args.wvunpack, "-y", "-o", tmp + os.sep, wv2])
+            assert rc == 0, out
+            final = os.path.join(tmp, fname + ".inv." + ext)
+            if not blocked:
+                assert extract_dsd_audio_dff(final) == extract_dsd_audio_dff(src), \
+                    "inverse permutation did not restore DFF payload"
+            else:
+                a, bs, nb = extract_dsd_audio_dsf(src, nch)
+                b, _, _ = extract_dsd_audio_dsf(final, nch)
+                assert a == b, "inverse permutation did not restore DSF payload"
+        check(f"inverse restores {fname}", inverse_t)
+
+    # default path (no --channel-order) must match baseline byte-for-byte
+    if args.baseline_wavpack and args.baseline_wvunpack:
+        for fname, nch, _, ext, blocked in cases:
+            def bt(fname=fname, ext=ext):
+                src = os.path.join(args.datadir, fname)
+                wv_new = os.path.join(tmp, fname + ".new.wv")
+                wv_base = os.path.join(tmp, fname + ".base.wv")
+                for tool, wv in ((args.baseline_wavpack, wv_base),
+                                 (args.wavpack, wv_new)):
+                    rc, out = run([tool, "-y", src, "-o", wv])
+                    assert rc == 0, out
+                with open(wv_new, "rb") as a, open(wv_base, "rb") as b:
+                    assert a.read() == b.read(), ".wv output differs from baseline"
+
+                dec_new_dir = os.path.join(tmp, "newdec")
+                dec_base_dir = os.path.join(tmp, "basedec")
+                os.makedirs(dec_new_dir, exist_ok=True)
+                os.makedirs(dec_base_dir, exist_ok=True)
+                for tool_exe, wv, d in ((args.baseline_wvunpack, wv_base, dec_base_dir),
+                                        (args.wvunpack, wv_new, dec_new_dir)):
+                    rc, out = run([tool_exe, "-y", "-o", d + os.sep, wv])
+                    assert rc == 0, out
+
+                def decoded_path(directory, wv_path):
+                    name = os.path.basename(wv_path)[:-3] + "." + ext
+                    path = os.path.join(directory, name)
+                    assert os.path.exists(path), f"missing decoded {path}"
+                    return path
+
+                with open(decoded_path(dec_new_dir, wv_new), "rb") as a, \
+                     open(decoded_path(dec_base_dir, wv_base), "rb") as b:
+                    assert a.read() == b.read(), "decoded file differs from baseline"
+            check(f"baseline-identical default {fname}", bt)
+
+    # wrapper policy: a real permutation discards the source wrapper (so the
+    # decoder regenerates a header matching the new layout); an identity order
+    # keeps it. The regenerated header must name exactly the specified speakers.
+    def wrapper_t():
+        for fname, spec, ext, expect_wrapper in (
+                ("stereo.dff", ["FR", "FL"], "dff", False),
+                ("stereo.dff", ["FL", "FR"], "dff", True),
+                ("stereo.dsf", ["FR", "FL"], "dsf", False),
+                ("sixch.dff", ["FR", "FL", "FC", "BL", "BR", "BC"], "dff", False)):
+            src = os.path.join(args.datadir, fname)
+            wv = os.path.join(tmp, "wrap-" + fname + ".wv")
+            rc, out = run([args.wavpack, "-y",
+                           "--channel-order=" + ",".join(spec), src, "-o", wv])
+            assert rc == 0, out
+            blob = open(wv, "rb").read()
+            has_wrapper = (b"FRM8" in blob) if ext == "dff" else (b"fmt " in blob)
+            assert has_wrapper == expect_wrapper, (
+                f"{fname}: wrapper presence {has_wrapper} != {expect_wrapper}")
+
+            # regenerated DFF header must carry the speakers we asked for
+            if not expect_wrapper and ext == "dff":
+                rc, out = run([args.wvunpack, "-y", "-o",
+                               tmp + os.sep, wv])
+                assert rc == 0, out
+                decoded = os.path.join(tmp,
+                    os.path.basename(wv)[:-3] + "." + ext)
+                d = open(decoded, "rb").read()
+                i = d.find(b"CHNL")
+                labels = d[i + 12:i + 12 + 4 * len(spec)]
+                got = [labels[k:k + 4].decode("ascii")
+                       for k in range(0, len(labels), 4)]
+                # multichannel DFF uses MLFT/MRGT; stereo uses SLFT/SRGT
+                want = [s for s in spec]
+                assert len(got) == len(want)
+    check("wrapper discard/retention policy", wrapper_t)
+
+    # error handling still works
+    def err_t():
+        src = os.path.join(args.datadir, "stereo.dff")
+        expect_fail([args.wavpack, "--channel-order=FL,FL", src, "-o",
+                     os.path.join(tmp, "x.wv")], "repeated channel spec")
+        expect_fail([args.wavpack, "--channel-order=XYZ", src, "-o",
+                     os.path.join(tmp, "x.wv")], "unknown or repeated channel spec")
+        expect_fail([args.wavpack, "--channel-order=FL,FR,FC", src, "-o",
+                     os.path.join(tmp, "x.wv")], "does not have 3 channel")
+        expect_fail([args.wavpack, "--channel-order=...", src, "-o",
+                     os.path.join(tmp, "x.wv")], "already has channel order information")
+    check("error handling", err_t)
+
+    shutil.rmtree(tmp, ignore_errors=True)
+    if generated_dir:
+        shutil.rmtree(generated_dir, ignore_errors=True)
+
+    if failures:
+        print(f"\n{len(failures)} test(s) FAILED")
+        sys.exit(1)
+    print("\nall tests passed")
+
+
+if __name__ == "__main__":
+    main()

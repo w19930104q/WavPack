@@ -453,6 +453,30 @@ a:hover {
      pipe the output of WavPack directly to WvUnpack for the sole purpose of reordering WAV files
      and adding the correct WAV headers!
     </p>
+    <p>
+     This option also works with DSD audio stored in Philips DSDIFF (.dff) and Sony DSF (.dsf) files.
+     Those formats identify their channels with DSD stream labels rather than Microsoft speaker names,
+     but each DSD label maps one-to-one to the same Microsoft speaker position, so either spelling may
+     be used in the list (and even mixed within one list). The accepted DSD labels and their mappings are:
+    </p>
+    <table border="1" cellpadding="4" cellspacing="0">
+     <tr><th>DSDIFF/DSF channel label</th><th>Microsoft speaker name</th><th>speaker mask bit</th></tr>
+     <tr><td><tt>SLFT</tt> (stereo) / <tt>MLFT</tt> (multichannel)</td><td><tt>FL</tt> &mdash; front left</td><td>0 (0x1)</td></tr>
+     <tr><td><tt>SRGT</tt> (stereo) / <tt>MRGT</tt> (multichannel)</td><td><tt>FR</tt> &mdash; front right</td><td>1 (0x2)</td></tr>
+     <tr><td><tt>C</tt></td><td><tt>FC</tt> &mdash; front center</td><td>2 (0x4)</td></tr>
+     <tr><td><tt>LFE</tt></td><td><tt>LFE</tt> &mdash; low frequency effects</td><td>3 (0x8)</td></tr>
+     <tr><td><tt>LS</tt></td><td><tt>BL</tt> &mdash; back left</td><td>4 (0x10)</td></tr>
+     <tr><td><tt>RS</tt></td><td><tt>BR</tt> &mdash; back right</td><td>5 (0x20)</td></tr>
+    </table>
+    <p>
+     As with PCM, naming the same speaker twice is an error. When the option only sets the channel mask
+     without changing the channel order (an identity list), encoding is unchanged and the source file's
+     wrapper is preserved. When it actually permutes the channels of a DSD file, the reordering is applied
+     to the DSD bytes before encoding and the original container wrapper is discarded, because its channel
+     labels and chunk sizes would no longer match the audio; on unpacking, WvUnpack regenerates a
+     self-consistent DSDIFF/DSF header from the new channel mask. The DSD audio itself remains lossless,
+     so a reorder followed by the inverse reorder restores the original bytes exactly.
+    </p>
 
 				<p>
 					<b><tt>--cross-decorr = use cross-channel correlation in hybrid mode</tt></b>

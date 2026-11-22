@@ -128,6 +128,12 @@ to indicate that channels are not assigned to specific speakers,
 or terminate list with
 .Dq ...
 to indicate that any channels beyond those specified are unassigned.
+For DSDIFF (.dff) and DSF (.dsf) DSD sources the DSD channel labels are
+also accepted and map one-to-one to Microsoft speaker positions:
+SLFT/MLFT=FL, SRGT/MRGT=FR, C=FC, LFE=LFE, LS=BL, RS=BR (the two names
+may be mixed in one list). When a DSD file is actually reordered its
+container wrapper is discarded and WvUnpack regenerates the DSDIFF/DSF
+header from the new channel mask; the DSD audio stays lossless.
 .It Fl -cross-decorr
 Use cross-channel correlation in hybrid mode.
 On by default in lossless mode and with the

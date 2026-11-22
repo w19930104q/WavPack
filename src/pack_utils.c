@@ -856,6 +856,38 @@ int WavpackAddWrapper (WavpackContext *wpc, void *data, uint32_t bcount)
     return add_to_metadata (wpc, data, bcount, meta_id);
 }
 
+// Discard any file wrapper (RIFF/CAFF/DSDIFF/DSF header and trailer) that has
+// already been queued via WavpackAddWrapper() but not yet written into a block.
+// This is used when a command-line operation (such as --channel-order on DSD
+// audio) rearranges the stream so that the original wrapper would no longer
+// describe the encoded data. Returns the number of wrapper metadata entries
+// removed. Configuration, MD5, tags and all other metadata are left untouched.
+
+int WavpackDiscardWrapper (WavpackContext *wpc)
+{
+    int removed = 0, si, di = 0;
+
+    if (!wpc)
+        return 0;
+
+    for (si = 0; si < wpc->metacount; ++si) {
+        unsigned char id = wpc->metadata [si].id & ID_UNIQUE;
+
+        if (id == (ID_RIFF_HEADER & ID_UNIQUE) || id == (ID_RIFF_TRAILER & ID_UNIQUE) ||
+            id == (ID_ALT_HEADER & ID_UNIQUE) || id == (ID_ALT_TRAILER & ID_UNIQUE)) {
+            free (wpc->metadata [si].data);
+            wpc->metabytes -= wpc->metadata [si].byte_length;
+            removed++;
+        }
+        else
+            wpc->metadata [di++] = wpc->metadata [si];
+    }
+
+    wpc->metacount = di;
+    wpc->riff_header_added = FALSE;
+    return removed;
+}
+
 // Store computed MD5 sum in WavPack metadata. Note that the user must compute
 // the 16 byte sum; it is not done here. A return of FALSE indicates an error.
 // If any of the lower 8 bits of qmode are set, then this MD5 is stored with

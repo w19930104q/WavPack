@@ -89,7 +89,11 @@ int ParseDsfHeaderConfig (FILE *infile, char *infilename, char *fourcc, WavpackC
     }
 #endif
 
-    if (config->channel_mask || (config->qmode & QMODE_CHANS_UNASSIGNED)) {
+    // A channel mask provided on the command line (--channel-order) overrides
+    // the channel type stored in the DSF header; only the "all unassigned"
+    // spec ("...") is rejected because the DSF header defines real channels.
+
+    if (config->qmode & QMODE_CHANS_UNASSIGNED) {
         error_line ("this DSF file already has channel order information!");
         return WAVPACK_SOFT_ERROR;
     }

@@ -246,12 +246,17 @@ int ParseDsdiffHeaderConfig (FILE *infile, char *infilename, char *fourcc, Wavpa
                     }
                 }
 
-                if (chanMask && (config->channel_mask || (config->qmode & QMODE_CHANS_UNASSIGNED))) {
+                // A channel mask provided on the command line (--channel-order)
+                // overrides the channel order stored in the DSDIFF header: the
+                // DSD labels map one-to-one to the same Microsoft speaker bits,
+                // so the user is allowed to reorder/relabel the channels.
+
+                if (chanMask && (config->qmode & QMODE_CHANS_UNASSIGNED)) {
                     error_line ("this DSDIFF file already has channel order information!");
                     free (prop_chunk);
                     return WAVPACK_SOFT_ERROR;
                 }
-                else if (chanMask)
+                else if (chanMask && !config->channel_mask)
                     config->channel_mask = chanMask;
 
                 config->bits_per_sample = 8;

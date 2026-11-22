@@ -165,10 +165,13 @@ static const char *help =
 "    --channel-order=<list>  specify (comma separated) channel order if not\n"
 "                             Microsoft standard (which is FL,FR,FC,LFE,BL,BR,\n"
 "                             FLC,FRC,BC,SL,SR,TC,TFL,TFC,TFR,TBL,TBC,TBR);\n"
-"                             specify '...' to indicate that channels are not\n"
-"                             assigned to specific speakers, or terminate list\n"
-"                             with '...' to indicate that any channels beyond\n"
-"                             those specified are unassigned\n"
+"                             DSDIFF/DSF DSD labels are accepted too and map\n"
+"                             to the same speakers: SLFT/MLFT=FL, SRGT/MRGT=FR,\n"
+"                             C=FC, LFE=LFE, LS=BL, RS=BR; specify '...' to\n"
+"                             indicate that channels are not assigned to\n"
+"                             specific speakers, or terminate list with '...'\n"
+"                             to indicate that any channels beyond those\n"
+"                             specified are unassigned\n"
 "    --cross-decorr          use cross-channel correlation in hybrid mode (on by\n"
 "                             default in lossless mode and with -cc option)\n"
 "    -d                      delete source file if successful (use with caution!)\n"
@@ -280,6 +283,31 @@ static const char *speakers [] = {
 };
 
 #define NUM_SPEAKERS (sizeof (speakers) / sizeof (speakers [0]))
+
+// DSDIFF channel labels (Sony/Philips DSD stream notation) are not separate
+// speaker positions: each maps one-to-one to a Microsoft speaker bit so that
+// --channel-order can be used with DSDIFF (.dff) and DSF (.dsf) sources.
+// "SLFT"/"MLFT" and "SRGT"/"MRGT" both denote front left/right (the S/M
+// prefix only distinguishes stereo from multichannel files). This table must
+// stay in sync with the label parsing in dsdiff.c / dsdiff_write.c.
+
+typedef struct {
+    const char *dsd_name;
+    int speaker_index;          // index into speakers[], i.e. the MS mask bit
+} DsdSpeaker;
+
+static const DsdSpeaker dsd_speakers [] = {
+    { "SLFT", 0  },             // FL
+    { "SRGT", 1  },             // FR
+    { "MLFT", 0  },             // FL (multichannel spelling)
+    { "MRGT", 1  },             // FR (multichannel spelling)
+    { "C",    2  },             // FC
+    { "LFE",  3  },             // LFE
+    { "LS",   4  },             // BL
+    { "RS",   5  }              // BR
+};
+
+#define NUM_DSD_SPEAKERS (sizeof (dsd_speakers) / sizeof (dsd_speakers [0]))
 
 int ParseRiffHeaderConfig (FILE *infile, char *infilename, char *fourcc, WavpackContext *wpc, WavpackConfig *config);
 int ParseWave64HeaderConfig (FILE *infile, char *infilename, char *fourcc, WavpackContext *wpc, WavpackConfig *config);
@@ -608,7 +636,7 @@ int main (int argc, char **argv)
                     if (!ci) {
                         channel_error = 1;
                         break;
-                    } 
+                    }
 
                     name [ci] = 0;
 
@@ -622,11 +650,30 @@ int main (int argc, char **argv)
                             break;
                         }
 
+                    // if not a Microsoft speaker name, try the DSDIFF labels
+                    // (SLFT/SRGT/...); these resolve to the same speaker bits
+
+                    if (si == NUM_SPEAKERS) {
+                        int di;
+
+                        for (di = 0; di < NUM_DSD_SPEAKERS; ++di)
+                            if (!stricmp (name, dsd_speakers [di].dsd_name)) {
+                                si = dsd_speakers [di].speaker_index;
+
+                                if (mask & (1L << si))
+                                    channel_error = 1;
+
+                                channel_order [chan] = si;
+                                mask |= (1L << si);
+                                break;
+                            }
+                    }
+
                     if (channel_error || si == NUM_SPEAKERS) {
                         error_line ("unknown or repeated channel spec: %s!", name);
                         channel_error = 1;
                         break;
-                    } 
+                    }
 
                     if (*long_param && *long_param++ != ',') {
                         channel_error = 1;
@@ -2071,6 +2118,33 @@ static int pack_file (char *infilename, char *outfilename, char *out2filename, c
                         if (new_channel_order [j] > i)
                             new_channel_order [j]--;
             }
+        }
+    }
+
+    // If --channel-order actually permutes the channels of a DSDIFF/DSF source,
+    // the wrapper queued while parsing the original header (channel labels/types,
+    // data chunk sizes) would contradict the reordered audio, so discard it. The
+    // decoder then regenerates a self-consistent DSD header from the new channel
+    // mask. An identity order (mask-only) leaves the wrapper untouched, keeping
+    // that path byte-for-byte identical to the original behaviour.
+
+    if (new_channel_order && (loc_config.qmode & QMODE_DSD_AUDIO) &&
+        !(loc_config.qmode & QMODE_REORDERED_CHANS)) {
+        int ci, actual_reorder = 0;
+
+        for (ci = 0; ci < loc_config.num_channels; ++ci)
+            if (new_channel_order [ci] != ci) {
+                actual_reorder = 1;
+                break;
+            }
+
+        if (actual_reorder && !(loc_config.qmode & QMODE_NO_STORE_WRAPPER)) {
+            WavpackDiscardWrapper (wpc);
+            loc_config.qmode |= QMODE_NO_STORE_WRAPPER;
+
+            if (debug_logging_mode)
+                error_line ("DSD channels reordered by --channel-order: discarding source "
+                    "wrapper; decoder will regenerate the header from the new channel mask");
         }
     }
 

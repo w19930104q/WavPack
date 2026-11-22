@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+"""Generate deterministic fixed-sample DSDIFF (.dff) and DSF (.dsf) test files.
+
+Run with: python3 -I gen_dsd_samples.py <outdir>
+
+Creates:
+  stereo.dff / stereo.dsf     2 channels, standard SLFT/SRGT (mask 0x3)
+  sixch.dff  / sixch.dsf      6 channels, 5.0 layout (no LFE -> mask 0x37:
+                              FL,FR,FC,BL,BR,BC in MS order; DSDIFF names
+                              SLFT,SRGT,C,LS,RS,C00)
+
+Every audio byte is a deterministic function of (channel, byte index) so a
+byte-for-byte round-trip can be asserted with plain file comparison.
+"""
+import os
+import struct
+import sys
+
+
+def be_chunk(cid: bytes, data: bytes) -> bytes:
+    pad = b"\0" if len(data) & 1 else b""
+    return cid + struct.pack(">q", len(data)) + data + pad
+
+
+def make_dff(path: str, num_channels: int, chan_names, samples_per_chan: int,
+             sample_rate: int = 2822400) -> None:
+    # DSD audio: interleaved bytes, one byte = 8 DSD samples, MSB-first.
+    # Each channel gets a distinct additive base so no two channels ever hold
+    # the same byte sequence (keeps reorder permutations observable everywhere).
+    audio = bytearray()
+    for s in range(samples_per_chan):
+        for c in range(num_channels):
+            audio.append((s * 31 + c * 17 + 0x5A + c * 0x40) & 0xFF)
+
+    fver = struct.pack(">I", 0x01050000)
+
+    fs = struct.pack(">I", sample_rate)
+    chnl = struct.pack(">H", num_channels) + b"".join(
+        name.encode("ascii") for name in chan_names)
+    cmpr_name = b"\x0enot compressed"
+    if len(cmpr_name) & 1:
+        cmpr_name += b"\0"
+    cmpr = b"DSD " + cmpr_name
+    prop_body = b"SND " + be_chunk(b"FS  ", fs) + be_chunk(b"CHNL", chnl) + \
+        be_chunk(b"CMPR", cmpr)
+    prop = be_chunk(b"PROP", prop_body)
+    data = be_chunk(b"DSD ", bytes(audio))
+
+    form_payload = b"DSD " + be_chunk(b"FVER", fver) + prop + data
+    with open(path, "wb") as f:
+        f.write(b"FRM8" + struct.pack(">q", len(form_payload)) + form_payload)
+
+
+DSF_BLOCK = 4096
+
+
+def make_dsf(path: str, num_channels: int, chan_type: int,
+             sample_count: int, sample_rate: int = 2822400) -> None:
+    # DSF: data blocked per channel, block size 4096 bytes; 1-bit LSB-first.
+    # Fill each channel block with deterministic bytes; pad with zeros (the
+    # encoder requires NULL padding of the partial last block).
+    total_blocks = (sample_count + DSF_BLOCK * 8 - 1) // (DSF_BLOCK * 8)
+    audio = bytearray()
+    for block in range(total_blocks):
+        for c in range(num_channels):
+            for i in range(DSF_BLOCK):
+                idx = block * DSF_BLOCK + i
+                if idx * 8 < sample_count:
+                    audio.append((idx * 31 + c * 17 + 0x5A + c * 0x40) & 0xFF)
+                else:
+                    audio.append(0)
+
+    data_size = 12 + len(audio)
+    file_size = 28 + 52 + 12 + len(audio) + 3
+    # DSFFormatChunk: ckID,ckSize,formatVersion,formatID,chanType,numChannels,
+    # sampleRate,bitsPerSample,sampleCount,blockSize,reserved(4 bytes)
+    fmt = struct.pack("<4sqIIIIIIqI4s", b"fmt ", 52, 1, 0, chan_type,
+                      num_channels, sample_rate, 1, sample_count,
+                      DSF_BLOCK, b"\0\0\0\0")
+    with open(path, "wb") as f:
+        f.write(struct.pack("<4sqqq", b"DSD ", 28, file_size, 0))
+        f.write(fmt)
+        f.write(struct.pack("<4sq", b"data", data_size))
+        f.write(bytes(audio))
+        f.write(b"\0\0\0")  # metadata placeholder
+
+
+def main(outdir: str) -> None:
+    os.makedirs(outdir, exist_ok=True)
+
+    # stereo: 2 channels, 10 DSD blocks worth = 40960 bytes/chan
+    make_dff(os.path.join(outdir, "stereo.dff"), 2,
+             ["SLFT", "SRGT"], DSF_BLOCK * 10)
+    make_dsf(os.path.join(outdir, "stereo.dsf"), 2, 2,
+             DSF_BLOCK * 10 * 8)
+
+    # 6-channel: DSF chanType 6 -> mask 0x37 = FL,FR,FC,BL,BR,BC
+    # DSDIFF names per dsdiff.c mapping for those mask bits
+    make_dff(os.path.join(outdir, "sixch.dff"), 6,
+             ["SLFT", "SRGT", "C   ", "LS  ", "RS  ", "C00 "],
+             DSF_BLOCK * 4)
+    make_dsf(os.path.join(outdir, "sixch.dsf"), 6, 6,
+             DSF_BLOCK * 4 * 8)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1])
