@@ -1580,7 +1580,7 @@ static void unreorder_channels (int32_t *data, unsigned char *order, int num_cha
 
 static int unpack_file (char *infilename, char *outfilename, int add_extension)
 {
-    int64_t skip_sample_index = 0, until_samples_total = 0, total_unpacked_samples = 0;
+    int64_t skip_sample_index = 0, until_samples_total = 0, total_unpacked_samples = 0, header_samples = 0;
     int result = WAVPACK_NO_ERROR, md5_diff = FALSE, created_riff_header = FALSE;
     int input_qmode, output_qmode = 0, input_format, output_format = 0;
     int open_flags = 0, padding_bytes = 0, num_channels, wvc_mode;
@@ -1860,7 +1860,26 @@ static int unpack_file (char *infilename, char *outfilename, int add_extension)
 #endif
 
     if (outfile && !raw_decode) {
-        if (until_samples_total) {
+        // figure out what sample count will go into the header we're about to write;
+        // this is -1 if the source length is unknown and no --until was specified
+
+        if (until_samples_total)
+            header_samples = until_samples_total;
+        else if (!WavpackGetWrapperBytes (wpc))
+            header_samples = WavpackGetNumSamples64 (wpc);
+
+        // the DFF and DSF formats have no way to represent an unknown length in their
+        // headers (unlike WAV/CAF), so if the length is unknown and the output is not
+        // seekable (meaning the header can't be rewritten after decoding), we must
+        // fail now before emitting a header that can never be made valid
+
+        if (header_samples == -1 && (output_format == WP_FORMAT_DFF || output_format == WP_FORMAT_DSF) &&
+            DoGetFilePosition (outfile) == -1) {
+                error_line ("can't write %s file of unknown length to non-seekable output (use --until to specify a length)",
+                    file_formats [output_format].format_name);
+                result = WAVPACK_SOFT_ERROR;
+        }
+        else if (until_samples_total) {
             if (!file_formats [output_format].WriteHeader (outfile, wpc, until_samples_total, output_qmode)) {
                 DoTruncateFile (outfile);
                 result = WAVPACK_SOFT_ERROR;
@@ -1961,11 +1980,23 @@ static int unpack_file (char *infilename, char *outfilename, int add_extension)
         WavpackFreeWrapper (wpc);
     }
 
+    // if the number of samples we actually decoded does not match the count we wrote into
+    // the header (e.g., the source length was unknown or --until ran past the end), seek
+    // back and rewrite the header with the real count; note that for DFF/DSF a header that
+    // does not match the payload is meaningless (there's no "unknown length" convention
+    // like WAV/CAF have), so if we can't fix the header we fail rather than emit a file
+    // that no parser can correctly read
+
     if (result == WAVPACK_NO_ERROR && outfile && created_riff_header &&
-        (WavpackGetNumSamples64 (wpc) == -1 ||
-         (until_samples_total ? until_samples_total : WavpackGetNumSamples64 (wpc)) != total_unpacked_samples)) {
-            if (*outfilename == '-' || DoSetFilePositionAbsolute (outfile, 0))
+        header_samples != total_unpacked_samples) {
+            if (DoSetFilePositionAbsolute (outfile, 0)) {
                 error_line ("can't update file header with actual size");
+
+                if (output_format == WP_FORMAT_DFF || output_format == WP_FORMAT_DSF) {
+                    DoTruncateFile (outfile);
+                    result = WAVPACK_SOFT_ERROR;
+                }
+            }
             else if (!file_formats [output_format].WriteHeader (outfile, wpc, total_unpacked_samples, output_qmode)) {
                 DoTruncateFile (outfile);
                 result = WAVPACK_SOFT_ERROR;

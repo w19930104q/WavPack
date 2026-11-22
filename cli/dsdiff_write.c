@@ -84,6 +84,13 @@ int WriteDsdiffHeader (FILE *outfile, WavpackContext *wpc, int64_t total_samples
         error_line ("WriteDsdiffHeader (), total samples = %lld, qmode = 0x%02x\n",
             (long long) total_samples, qmode);
 
+    // if the length is unknown, write a self-consistent zero-length placeholder header;
+    // it will be rewritten with the real count after decoding (wvunpack refuses
+    // non-seekable outputs in this case, so a fixup is always possible)
+
+    if (total_samples == -1)
+        total_samples = 0;
+
     cmpr_name_size = (strlen (cmpr_name) + 1) & ~1;
     chan_ids_size = num_channels * 4;
     chan_ids = malloc (chan_ids_size);

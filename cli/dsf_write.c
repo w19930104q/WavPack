@@ -68,6 +68,13 @@ int WriteDsfHeader (FILE *outfile, WavpackContext *wpc, int64_t total_samples, i
         error_line ("WriteDsfHeader (), total samples = %lld, qmode = 0x%02x\n",
             (long long) total_samples, qmode);
 
+    // if the length is unknown, write a self-consistent zero-length placeholder header;
+    // it will be rewritten with the real count after decoding (wvunpack refuses
+    // non-seekable outputs in this case, so a fixup is always possible)
+
+    if (total_samples == -1)
+        total_samples = 0;
+
     for (i = 0; i < NUM_CHAN_TYPES; ++i)
         if (chan_mask == channel_masks [i])
             chan_type = i + 1;
