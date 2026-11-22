@@ -248,6 +248,25 @@ int WavpackSetConfiguration64 (WavpackContext *wpc, WavpackConfig *config, int64
             return FALSE;
         }
 
+        // The number of speakers represented by the channel mask must match the
+        // channel count; otherwise the resulting file cannot be decoded back to
+        // the source. Reject it here as a defense-in-depth check for callers
+        // other than the WavPack command-line programs.
+
+        if (chan_mask) {
+            uint32_t mask = chan_mask, mask_channels = 0;
+
+            while (mask) {
+                mask_channels += mask & 1;
+                mask >>= 1;
+            }
+
+            if (mask_channels != (uint32_t) num_chans) {
+                strcpy (wpc->error_message, "DSD channel mask does not match the channel count!");
+                return FALSE;
+            }
+        }
+
         // with DSD, very few PCM options work (or make sense), so only allow those that do
         config->flags &= (CONFIG_HIGH_FLAG | CONFIG_MD5_CHECKSUM | CONFIG_PAIR_UNDEF_CHANS);
         config->float_norm_exp = config->xmode = 0;

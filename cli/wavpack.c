@@ -2857,8 +2857,14 @@ static int pack_dsd_audio (WavpackContext *wpc, FILE *infile, int qmode, unsigne
                     }
 
                     if (non_null) {
-                        error_line ("blocks not padded with NULLs, MD5 will not match!");
-                        res = WAVPACK_WARNINGS;
+                        // For DSF input the header parser already rejects non-zero block
+                        // padding; this catches sources that could not be pre-validated
+                        // (e.g. non-seekable pipes). A padded block cannot be restored
+                        // byte-for-byte, so fail instead of silently archiving junk.
+                        error_line ("DSD block padding contains non-zero data; cannot create a lossless archive");
+                        free (sample_buffer);
+                        free (input_buffer);
+                        return WAVPACK_HARD_ERROR;
                     }
                 }
                 else {
