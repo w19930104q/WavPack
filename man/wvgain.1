@@ -17,6 +17,9 @@ ReplayGain-enabled players will use this information
 to produce the same perceived loudness on all tracks.
 Both individual track and whole album ReplayGain information
 can be calculated.
+Multichannel files (up to 7.1) are supported; the channel
+loudness contributions are weighted per ITU-R BS.1770
+(front channels 1.0, surround channels 1.41, LFE excluded).
 On multicore machines multiple threads
 are used to improve the speed by about 2x, unless the
 .Fl 1

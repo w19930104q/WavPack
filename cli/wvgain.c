@@ -104,6 +104,19 @@ int debug_logging_mode;
 #define HISTOGRAM_SLOTS 12000
 static uint32_t track_histogram [HISTOGRAM_SLOTS], album_histogram [HISTOGRAM_SLOTS];
 
+// Maximum number of channels supported (8 allows up to 7.1). Multichannel
+// loudness is computed with the ITU-R BS.1770 channel weighting: the front
+// left, right and center channels have a weight of 1.0, all surround (rear)
+// channels have a weight of 1.41, and the LFE channel is excluded (weight 0.0).
+// The weights multiply the mean-square (power) of each channel, exactly as
+// G_i multiplies z_i in the BS.1770 loudness equation. Mono and stereo files
+// are unaffected (all weights 1.0), preserving the classic ReplayGain results.
+
+#define MAX_CHANNELS 8
+#define SURROUND_WEIGHT 1.41
+
+static double chan_weights [MAX_CHANNELS];
+
 static char album_mode, clean_mode, display_mode, ignore_wvc, quiet_mode, show_mode, new_mode, set_console_title;
 static int num_files, file_index, worker_threads;
 
@@ -589,15 +602,16 @@ int main(int argc, char **argv)
 // Unpack the specified WavPack input file and analyze it for ReplayGain
 // information.
 
-static void calc_stereo_peak (float *samples, uint32_t samcnt, float *peak_p);
-static double calc_stereo_rms (float *samples, uint32_t samcnt);
-static int filter_init (uint32_t sample_rate);
-static void filter_stereo_samples (float *samples, uint32_t samcnt);
+static void calc_peak (float *samples, uint32_t samcnt, float *peak_p);
+static double calc_weighted_rms (float *samples, uint32_t samcnt);
+static int filter_init (uint32_t sample_rate, int num_channels);
+static void filter_samples (float *samples, uint32_t samcnt);
 static void float_samples (float *dst, int32_t *src, uint32_t samcnt, float scale);
+static void compute_channel_weights (int num_channels, uint32_t channel_mask);
 
 static int analyze_file (char *infilename, uint32_t *histogram, float *peak)
 {
-    int result = WAVPACK_NO_ERROR, open_flags = 0, num_channels, wvc_mode;
+    int result = WAVPACK_NO_ERROR, open_flags = 0, num_channels, analysis_channels, wvc_mode;
     uint32_t sample_rate, window_samples, num_windows = 1;
     int64_t total_unpacked_samples = 0;
     void *decimation_context = NULL;
@@ -631,9 +645,23 @@ static int analyze_file (char *infilename, uint32_t *histogram, float *peak)
     wvc_mode = WavpackGetMode (wpc) & MODE_WVC;
     num_channels = WavpackGetNumChannels (wpc);
 
-    if (num_channels > 2) {
-        error_line ("can't handle multichannel files yet!");
+    if (num_channels > MAX_CHANNELS) {
+        error_line ("can't handle more than %d channels!", MAX_CHANNELS);
+        WavpackCloseFile (wpc);
         return WAVPACK_SOFT_ERROR;
+    }
+
+    // Determine the per-channel loudness weights (ITU-R BS.1770). Mono files are
+    // analyzed as dual-mono (both weights 1.0), so the classic mono and stereo
+    // ReplayGain results are unchanged.
+
+    if (num_channels == 1) {
+        analysis_channels = 2;
+        chan_weights [0] = chan_weights [1] = 1.0;
+    }
+    else {
+        analysis_channels = num_channels;
+        compute_channel_weights (num_channels, WavpackGetChannelMask (wpc));
     }
 
     if (!quiet_mode) {
@@ -649,7 +677,7 @@ static int analyze_file (char *infilename, uint32_t *histogram, float *peak)
         sample_rate /= 4;
     }
 
-    if (!filter_init (sample_rate))
+    if (!filter_init (sample_rate, analysis_channels))
         result = WAVPACK_SOFT_ERROR;
 
     if (result == WAVPACK_NO_ERROR) {
@@ -659,9 +687,9 @@ static int analyze_file (char *infilename, uint32_t *histogram, float *peak)
             num_windows = (worker_threads + 1) * 48000 / window_samples;
 
         if (decimation_context)
-            temp_buffer = malloc (num_windows * window_samples * 8 * 4);
+            temp_buffer = malloc (num_windows * window_samples * analysis_channels * 4 * 4);
         else
-            temp_buffer = malloc (num_windows * window_samples * 8);
+            temp_buffer = malloc (num_windows * window_samples * analysis_channels * 4);
     }
 
     while (result == WAVPACK_NO_ERROR) {
@@ -700,25 +728,25 @@ static int analyze_file (char *infilename, uint32_t *histogram, float *peak)
             if (!(WavpackGetMode (wpc) & MODE_FLOAT))
                 switch (WavpackGetBytesPerSample (wpc)) {
                     case 1:
-                        float_samples ((float *) window_ptr, window_ptr, samples_this_window * 2, 1.0 / 128.0);
+                        float_samples ((float *) window_ptr, window_ptr, samples_this_window * analysis_channels, 1.0 / 128.0);
                         break;
 
                     case 2:
-                        float_samples ((float *) window_ptr, window_ptr, samples_this_window * 2, 1.0 / 32768.0);
+                        float_samples ((float *) window_ptr, window_ptr, samples_this_window * analysis_channels, 1.0 / 32768.0);
                         break;
 
                     case 3:
-                        float_samples ((float *) window_ptr, window_ptr, samples_this_window * 2, 1.0 / 8388608.0);
+                        float_samples ((float *) window_ptr, window_ptr, samples_this_window * analysis_channels, 1.0 / 8388608.0);
                         break;
 
                     case 4:
-                        float_samples ((float *) window_ptr, window_ptr, samples_this_window * 2, 1.0 / 2147483648.0);
+                        float_samples ((float *) window_ptr, window_ptr, samples_this_window * analysis_channels, 1.0 / 2147483648.0);
                         break;
                 }
 
-            calc_stereo_peak ((float *) window_ptr, samples_this_window, peak);
-            filter_stereo_samples ((float *) window_ptr, samples_this_window);
-            level = (int32_t) floor (100 * calc_stereo_rms ((float *) window_ptr, samples_this_window));
+            calc_peak ((float *) window_ptr, samples_this_window, peak);
+            filter_samples ((float *) window_ptr, samples_this_window);
+            level = (int32_t) floor (100 * calc_weighted_rms ((float *) window_ptr, samples_this_window));
 
             if (level < 0)
                 histogram [0]++;
@@ -727,7 +755,7 @@ static int analyze_file (char *infilename, uint32_t *histogram, float *peak)
             else
                 histogram [level]++;
 
-            window_ptr += samples_this_window * 2;
+            window_ptr += samples_this_window * analysis_channels;
             samples_unpacked -= samples_this_window;
         }
 
@@ -1143,12 +1171,53 @@ static struct rg_freqinfo freqinfos[] =
 };
 
 static double *yule_coeff_a, *yule_coeff_b, *butter_coeff_a, *butter_coeff_b;
-static float yule_hist_a [256], yule_hist_b [256], butter_hist_a [256], butter_hist_b [256];
-static int yule_hist_i, butter_hist_i;
+static float *yule_hist_a, *yule_hist_b, *butter_hist_a, *butter_hist_b;
+static int yule_hist_i, butter_hist_i, filter_channels;
+
+// Determine the per-channel loudness weights from the Microsoft channel mask
+// using the ITU-R BS.1770 convention: front left, front right and front center
+// are weighted 1.0, all surround/rear channels are weighted 1.41, and the LFE
+// channel is excluded entirely (weight 0.0). If the file does not specify a
+// channel mask, 6-channel files default to 5.1 (FL FR FC LFE BL BR) and
+// 8-channel files default to 7.1 (FL FR FC LFE BL BR SL SR); any other channel
+// count without a mask is treated as all front channels (all weights 1.0).
+
+static void compute_channel_weights (int num_channels, uint32_t channel_mask)
+{
+    int chan = 0, bit;
+
+    if (!channel_mask) {
+        if (num_channels == 6)
+            channel_mask = 0x3f;        // 5.1: FL FR FC LFE BL BR
+        else if (num_channels == 8)
+            channel_mask = 0x63f;       // 7.1: FL FR FC LFE BL BR SL SR
+    }
+
+    // channels are assigned to mask bits in ascending bit order
+
+    for (bit = 0; bit < 32 && chan < num_channels; ++bit) {
+        uint32_t mask_bit = 1 << bit;
+
+        if (!(channel_mask & mask_bit))
+            continue;
+
+        if (mask_bit == 0x8)                            // LFE: excluded
+            chan_weights [chan++] = 0.0;
+        else if (mask_bit == 0x1 || mask_bit == 0x2 || mask_bit == 0x4)
+            chan_weights [chan++] = 1.0;                // FL, FR, FC
+        else
+            chan_weights [chan++] = SURROUND_WEIGHT;    // surrounds / rears
+    }
+
+    // if the mask did not account for every channel, assume front channels
+
+    while (chan < num_channels)
+        chan_weights [chan++] = 1.0;
+}
 
 // Initialize filters; return FALSE is specified sampling rate is not supported
 
-static int filter_init (uint32_t sample_rate)
+static int filter_init (uint32_t sample_rate, int num_channels)
 {
     int i, n = sizeof (freqinfos) / sizeof (freqinfos [0]);
 
@@ -1166,110 +1235,108 @@ static int filter_init (uint32_t sample_rate)
     butter_coeff_a = freqinfos [i].AButter;
     butter_coeff_b = freqinfos [i].BButter;
 
-    memset (yule_hist_a, 0, sizeof (yule_hist_a));
-    memset (yule_hist_b, 0, sizeof (yule_hist_b));
-    yule_hist_i = 20;
+    free (yule_hist_a);
+    free (yule_hist_b);
+    free (butter_hist_a);
+    free (butter_hist_b);
 
-    memset (butter_hist_a, 0, sizeof (butter_hist_a));
-    memset (butter_hist_b, 0, sizeof (butter_hist_b));
-    butter_hist_i = 4;
+    filter_channels = num_channels;
+    yule_hist_a = calloc (256 * num_channels, sizeof (*yule_hist_a));
+    yule_hist_b = calloc (256 * num_channels, sizeof (*yule_hist_b));
+    yule_hist_i = YULE_ORDER * num_channels;
+
+    butter_hist_a = calloc (256 * num_channels, sizeof (*butter_hist_a));
+    butter_hist_b = calloc (256 * num_channels, sizeof (*butter_hist_b));
+    butter_hist_i = BUTTER_ORDER * num_channels;
+
+    if (!yule_hist_a || !yule_hist_b || !butter_hist_a || !butter_hist_b) {
+        error_line ("can't allocate memory!");
+        return FALSE;
+    }
+
     return TRUE;
 }
 
-// Optimized mplementation of 2nd-order IIR stereo filter
+// Optimized implementation of 2nd-order IIR filter (any channel count)
 
-static void butter_filter_stereo_samples (float *samples, uint32_t samcnt)
+static void butter_filter_samples (float *samples, uint32_t samcnt)
 {
-    double left, right;
-    int i, j;
+    int nch = filter_channels;
+    int i, j, c;
 
     i = butter_hist_i;
 
     // If filter history is very small magnitude, clear it completely to prevent denormals
     // from rattling around in there forever (slowing us down).
 
-    for (j = -4; j < 0; ++j)
+    for (j = -BUTTER_ORDER * nch; j < 0; ++j)
         if (fabs (butter_hist_a [i + j]) > 1e-10 || fabs (butter_hist_b [i + j]) > 1e-10)
             break;
 
     if (!j) {
-        memset (butter_hist_a, 0, sizeof (butter_hist_a));
-        memset (butter_hist_b, 0, sizeof (butter_hist_b));
+        memset (butter_hist_a, 0, sizeof (butter_hist_a [0]) * 256 * nch);
+        memset (butter_hist_b, 0, sizeof (butter_hist_b [0]) * 256 * nch);
     }
 
     while (samcnt--) {
-        left   = (butter_hist_b [i] = samples [0]) * butter_coeff_b [0];
-        right  = (butter_hist_b [i + 1] = samples [1]) * butter_coeff_b [0];
-        left  += butter_hist_b [i - 2] * butter_coeff_b [1] - butter_hist_a [i - 2] * butter_coeff_a [1];
-        right += butter_hist_b [i - 1] * butter_coeff_b [1] - butter_hist_a [i - 1] * butter_coeff_a [1];
-        left  += butter_hist_b [i - 4] * butter_coeff_b [2] - butter_hist_a [i - 4] * butter_coeff_a [2];
-        right += butter_hist_b [i - 3] * butter_coeff_b [2] - butter_hist_a [i - 3] * butter_coeff_a [2];
-        samples [0] = butter_hist_a [i] = (float) left;
-        samples [1] = butter_hist_a [i + 1] = (float) right;
-        samples += 2;
+        for (c = 0; c < nch; ++c) {
+            double sum = (butter_hist_b [i + c] = samples [c]) * butter_coeff_b [0];
 
-        if ((i += 2) == 256) {
-            memcpy (butter_hist_a, butter_hist_a + 252, sizeof (butter_hist_a [0]) * 4);
-            memcpy (butter_hist_b, butter_hist_b + 252, sizeof (butter_hist_b [0]) * 4);
-            i = 4;
+            sum += butter_hist_b [i + c - nch] * butter_coeff_b [1] - butter_hist_a [i + c - nch] * butter_coeff_a [1];
+            sum += butter_hist_b [i + c - 2 * nch] * butter_coeff_b [2] - butter_hist_a [i + c - 2 * nch] * butter_coeff_a [2];
+            samples [c] = butter_hist_a [i + c] = (float) sum;
+        }
+
+        samples += nch;
+
+        if ((i += nch) == 256 * nch) {
+            memcpy (butter_hist_a, butter_hist_a + (256 - BUTTER_ORDER) * nch, sizeof (butter_hist_a [0]) * BUTTER_ORDER * nch);
+            memcpy (butter_hist_b, butter_hist_b + (256 - BUTTER_ORDER) * nch, sizeof (butter_hist_b [0]) * BUTTER_ORDER * nch);
+            i = BUTTER_ORDER * nch;
         }
     }
 
     butter_hist_i = i;
 }
 
-// Optimized mplementation of 10th-order IIR stereo filter
+// Optimized implementation of 10th-order IIR filter (any channel count)
 
-static void yule_filter_stereo_samples (float *samples, uint32_t samcnt)
+static void yule_filter_samples (float *samples, uint32_t samcnt)
 {
-    double left, right;
-    int i, j;
+    int nch = filter_channels;
+    int i, j, c;
 
     i = yule_hist_i;
 
     // If filter history is very small magnitude, clear it completely to prevent denormals
     // from rattling around in there forever (slowing us down).
 
-    for (j = -20; j < 0; ++j)
+    for (j = -YULE_ORDER * nch; j < 0; ++j)
         if (fabs (yule_hist_a [i + j]) > 1e-10 || fabs (yule_hist_b [i + j]) > 1e-10)
             break;
 
     if (!j) {
-        memset (yule_hist_a, 0, sizeof (yule_hist_a));
-        memset (yule_hist_b, 0, sizeof (yule_hist_b));
+        memset (yule_hist_a, 0, sizeof (yule_hist_a [0]) * 256 * nch);
+        memset (yule_hist_b, 0, sizeof (yule_hist_b [0]) * 256 * nch);
     }
 
     while (samcnt--) {
-        left   = (yule_hist_b [i] = samples [0]) * yule_coeff_b [0];
-        right  = (yule_hist_b [i + 1] = samples [1]) * yule_coeff_b [0];
-        left  += yule_hist_b [i - 2] * yule_coeff_b [1] - yule_hist_a [i - 2] * yule_coeff_a [1];
-        right += yule_hist_b [i - 1] * yule_coeff_b [1] - yule_hist_a [i - 1] * yule_coeff_a [1];
-        left  += yule_hist_b [i - 4] * yule_coeff_b [2] - yule_hist_a [i - 4] * yule_coeff_a [2];
-        right += yule_hist_b [i - 3] * yule_coeff_b [2] - yule_hist_a [i - 3] * yule_coeff_a [2];
-        left  += yule_hist_b [i - 6] * yule_coeff_b [3] - yule_hist_a [i - 6] * yule_coeff_a [3];
-        right += yule_hist_b [i - 5] * yule_coeff_b [3] - yule_hist_a [i - 5] * yule_coeff_a [3];
-        left  += yule_hist_b [i - 8] * yule_coeff_b [4] - yule_hist_a [i - 8] * yule_coeff_a [4];
-        right += yule_hist_b [i - 7] * yule_coeff_b [4] - yule_hist_a [i - 7] * yule_coeff_a [4];
-        left  += yule_hist_b [i - 10] * yule_coeff_b [5] - yule_hist_a [i - 10] * yule_coeff_a [5];
-        right += yule_hist_b [i - 9] * yule_coeff_b [5] - yule_hist_a [i - 9] * yule_coeff_a [5];
-        left  += yule_hist_b [i - 12] * yule_coeff_b [6] - yule_hist_a [i - 12] * yule_coeff_a [6];
-        right += yule_hist_b [i - 11] * yule_coeff_b [6] - yule_hist_a [i - 11] * yule_coeff_a [6];
-        left  += yule_hist_b [i - 14] * yule_coeff_b [7] - yule_hist_a [i - 14] * yule_coeff_a [7];
-        right += yule_hist_b [i - 13] * yule_coeff_b [7] - yule_hist_a [i - 13] * yule_coeff_a [7];
-        left  += yule_hist_b [i - 16] * yule_coeff_b [8] - yule_hist_a [i - 16] * yule_coeff_a [8];
-        right += yule_hist_b [i - 15] * yule_coeff_b [8] - yule_hist_a [i - 15] * yule_coeff_a [8];
-        left  += yule_hist_b [i - 18] * yule_coeff_b [9] - yule_hist_a [i - 18] * yule_coeff_a [9];
-        right += yule_hist_b [i - 17] * yule_coeff_b [9] - yule_hist_a [i - 17] * yule_coeff_a [9];
-        left  += yule_hist_b [i - 20] * yule_coeff_b [10] - yule_hist_a [i - 20] * yule_coeff_a [10];
-        right += yule_hist_b [i - 19] * yule_coeff_b [10] - yule_hist_a [i - 19] * yule_coeff_a [10];
-        samples [0] = yule_hist_a [i] = (float) left;
-        samples [1] = yule_hist_a [i + 1] = (float) right;
-        samples += 2;
+        for (c = 0; c < nch; ++c) {
+            double sum = (yule_hist_b [i + c] = samples [c]) * yule_coeff_b [0];
+            int k;
 
-        if ((i += 2) == 256) {
-            memcpy (yule_hist_a, yule_hist_a + 236, sizeof (yule_hist_a [0]) * 20);
-            memcpy (yule_hist_b, yule_hist_b + 236, sizeof (yule_hist_b [0]) * 20);
-            i = 20;
+            for (k = 1; k <= YULE_ORDER; ++k)
+                sum += yule_hist_b [i + c - k * nch] * yule_coeff_b [k] - yule_hist_a [i + c - k * nch] * yule_coeff_a [k];
+
+            samples [c] = yule_hist_a [i + c] = (float) sum;
+        }
+
+        samples += nch;
+
+        if ((i += nch) == 256 * nch) {
+            memcpy (yule_hist_a, yule_hist_a + (256 - YULE_ORDER) * nch, sizeof (yule_hist_a [0]) * YULE_ORDER * nch);
+            memcpy (yule_hist_b, yule_hist_b + (256 - YULE_ORDER) * nch, sizeof (yule_hist_b [0]) * YULE_ORDER * nch);
+            i = YULE_ORDER * nch;
         }
     }
 
@@ -1278,47 +1345,52 @@ static void yule_filter_stereo_samples (float *samples, uint32_t samcnt)
 
 // Apply both filters sequentially
 
-static void filter_stereo_samples (float *samples, uint32_t samcnt)
+static void filter_samples (float *samples, uint32_t samcnt)
 {
-    yule_filter_stereo_samples (samples, samcnt);
-    butter_filter_stereo_samples (samples, samcnt);
+    yule_filter_samples (samples, samcnt);
+    butter_filter_samples (samples, samcnt);
 }
 
 // Update largest absolute sample value
 
-static void calc_stereo_peak (float *samples, uint32_t samcnt, float *peak_p)
+static void calc_peak (float *samples, uint32_t samcnt, float *peak_p)
 {
+    int nch = filter_channels, c;
     float peak = 0.0;
 
     while (samcnt--) {
-        if (samples [0] > peak)
-            peak = samples [0];
-        else if (-samples [0] > peak)
-            peak = -samples [0];
+        for (c = 0; c < nch; ++c)
+            if (samples [c] > peak)
+                peak = samples [c];
+            else if (-samples [c] > peak)
+                peak = -samples [c];
 
-        if (samples [1] > peak)
-            peak = samples [1];
-        else if (-samples [1] > peak)
-            peak = -samples [1];
-
-        samples += 2;
+        samples += nch;
     }
 
     if (peak > *peak_p)
         *peak_p = peak;
 }
 
-// Calculate stereo rms level. Minimum value is about -100 dB for digital silence. The 90 dB
-// offset is to compensate for the normalized float range and 3 dB is for stereo samples.
+// Calculate the BS.1770-weighted rms level over all channels. Minimum value is
+// about -100 dB for digital silence. The 90 dB offset is to compensate for the
+// normalized float range and 3 dB is for the classic stereo calibration (which
+// is retained for all channel counts so that stereo results are unchanged).
 
-static double calc_stereo_rms (float *samples, uint32_t samcnt)
+static double calc_weighted_rms (float *samples, uint32_t samcnt)
 {
+    int nch = filter_channels, c;
     uint32_t cnt = samcnt;
     double sum = 1e-16;
 
     while (cnt--) {
-        sum += samples [0] * samples [0] + samples [1] * samples [1];
-        samples += 2;
+        double frame_sum = 0.0;
+
+        for (c = 0; c < nch; ++c)
+            frame_sum += chan_weights [c] * samples [c] * samples [c];
+
+        sum += frame_sum;
+        samples += nch;
     }
 
     return 10 * log10 (sum / samcnt) + 90.0 - 3.0;
