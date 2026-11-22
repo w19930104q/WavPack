@@ -273,6 +273,15 @@ int ParseDsdiffHeaderConfig (FILE *infile, char *infilename, char *fourcc, Wavpa
                 return WAVPACK_SOFT_ERROR;
             }
 
+            // The DSD data must contain a whole number of samples for every
+            // channel; otherwise the trailing partial frame would be silently
+            // truncated by the division below, so reject the file instead.
+
+            if (dff_chunk_header.ckDataSize % config->num_channels) {
+                error_line ("%s is not a valid .DFF file!", infilename);
+                return WAVPACK_SOFT_ERROR;
+            }
+
             total_samples = dff_chunk_header.ckDataSize / config->num_channels;
 
             if (total_samples <= 0 || total_samples > MAX_WAVPACK_SAMPLES) {
