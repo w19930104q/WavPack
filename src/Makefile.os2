@@ -41,6 +41,7 @@ SRCS = common_utils.c &
 	entropy_utils.c &
 	extra1.c &
 	extra2.c &
+	flacdec.c &
 	open_utils.c &
 	open_filename.c &
 	open_legacy.c &

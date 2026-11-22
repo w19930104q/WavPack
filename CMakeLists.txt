@@ -160,6 +160,7 @@ add_library(wavpack
     src/entropy_utils.c
     src/extra1.c
     src/extra2.c
+    src/flacdec.c
     src/open_utils.c
     src/open_filename.c
     src/open_legacy.c
@@ -247,6 +248,21 @@ endif()
 # Symbols files
 
 set(WAVPACK_EXPORT_SYMBOLS
+    FlacDecClose
+    FlacDecGetBitsPerSample
+    FlacDecGetError
+    FlacDecGetMD5
+    FlacDecGetNumChannels
+    FlacDecGetNumPictures
+    FlacDecGetNumTagItems
+    FlacDecGetPicture
+    FlacDecGetSampleRate
+    FlacDecGetSamplesDecoded
+    FlacDecGetTagItemName
+    FlacDecGetTagItemValue
+    FlacDecGetTotalSamples
+    FlacDecOpen
+    FlacDecRead
     WavpackAddWrapper
     WavpackAppendBinaryTagItem
     WavpackAppendTagItem
@@ -374,7 +390,7 @@ if(BUILD_SHARED_LIBS)
 endif()
 
 set_target_properties(wavpack PROPERTIES EXPORT_NAME WavPack)
-set_target_properties(wavpack PROPERTIES PUBLIC_HEADER "${CMAKE_CURRENT_SOURCE_DIR}/include/wavpack.h")
+set_target_properties(wavpack PROPERTIES PUBLIC_HEADER "${CMAKE_CURRENT_SOURCE_DIR}/include/wavpack.h;${CMAKE_CURRENT_SOURCE_DIR}/include/flacdec.h")
 
 if(WAVPACK_BUILD_PROGRAMS)
 	if(NOT WIN32)
@@ -413,6 +429,7 @@ if(WAVPACK_BUILD_PROGRAMS)
 		cli/caff.c
 		cli/dsdiff.c
 		cli/dsf.c
+		cli/flac.c
 		cli/utils.c
 		cli/md5.c
 		cli/import_id3.c

@@ -287,6 +287,11 @@ int ParseCaffHeaderConfig (FILE *infile, char *infilename, char *fourcc, Wavpack
 int ParseDsdiffHeaderConfig (FILE *infile, char *infilename, char *fourcc, WavpackContext *wpc, WavpackConfig *config);
 int ParseDsfHeaderConfig (FILE *infile, char *infilename, char *fourcc, WavpackContext *wpc, WavpackConfig *config);
 int ParseAiffHeaderConfig (FILE *infile, char *infilename, char *fourcc, WavpackContext *wpc, WavpackConfig *config);
+int ParseFlacHeaderConfig (FILE *infile, char *infilename, char *fourcc, WavpackContext *wpc, WavpackConfig *config);
+int FlacCliRead (FILE *infile, void *buffer, uint32_t bytes, uint32_t *bytes_read);
+int FlacCliVerify (const unsigned char *md5_digest);
+int FlacCliImportTags (WavpackContext *wpc);
+void FlacCliClose (void);
 
 static struct {
     unsigned char id;
@@ -301,7 +306,8 @@ static struct {
     { WP_FORMAT_CAF,  "caff", "caf", ParseCaffHeaderConfig,   1 },
     { WP_FORMAT_DFF,  "FRM8", "dff", ParseDsdiffHeaderConfig, 2 },
     { WP_FORMAT_DSF,  "DSD ", "dsf", ParseDsfHeaderConfig,    1 },
-    { WP_FORMAT_AIF,  "FORM", "aif", ParseAiffHeaderConfig,   2 }
+    { WP_FORMAT_AIF,  "FORM", "aif", ParseAiffHeaderConfig,   2 },
+    { WP_FORMAT_FLA,  "fLaC", "flac", ParseFlacHeaderConfig,  1 }
 };
 
 #define NUM_FILE_FORMATS (sizeof (file_formats) / sizeof (file_formats [0]))
@@ -313,7 +319,7 @@ int debug_logging_mode;
 
 static int overwrite_all, no_overwrite, num_files, file_index, copy_time, quiet_mode, verify_mode, delete_source,
     no_utf8_convert, set_console_title, allow_huge_tags, quantize_bits, quantize_round, import_id3,
-    raw_pcm_skip_bytes_begin, raw_pcm_skip_bytes_end, worker_threads;
+    raw_pcm_skip_bytes_begin, raw_pcm_skip_bytes_end, worker_threads, flac_input_mode;
 
 static int num_channels_order;
 static unsigned char channel_order [18];
@@ -1688,6 +1694,7 @@ static int pack_file (char *infilename, char *outfilename, char *out2filename, c
 
     CLEAR (wv_file);
     CLEAR (wvc_file);
+    flac_input_mode = 0;
     wpc = WavpackOpenFileOutput (write_block, &wv_file, out2filename ? &wvc_file : NULL);
 
     // open the source file for reading
@@ -1980,6 +1987,7 @@ static int pack_file (char *infilename, char *outfilename, char *out2filename, c
                 }
 
                 chunk_alignment = file_formats [i].chunk_alignment;
+                flac_input_mode = (file_formats [i].id == WP_FORMAT_FLA);
                 break;
             }
 
@@ -2104,6 +2112,12 @@ static int pack_file (char *infilename, char *outfilename, char *out2filename, c
     if (new_channel_order)
         free (new_channel_order);
 
+    // for FLAC sources, verify that the decoded audio matched the FLAC MD5
+    // and sample count before we consider storing anything
+
+    if (flac_input_mode && result == WAVPACK_NO_ERROR)
+        result = FlacCliVerify (md5_digest);
+
     // write the md5 sum if the user asked for it to be included
 
     if (result == WAVPACK_NO_ERROR && (loc_config.flags & CONFIG_MD5_CHECKSUM))
@@ -2193,6 +2207,22 @@ static int pack_file (char *infilename, char *outfilename, char *out2filename, c
 
         free (buffer);
     }
+
+    // for FLAC sources, import the Vorbis comments and embedded pictures
+    // as APEv2 tag items now
+
+    if (result == WAVPACK_NO_ERROR && flac_input_mode) {
+        imported_tag_items = FlacCliImportTags (wpc);
+
+        if (imported_tag_items < 0) {
+            error_line ("%s", WavpackGetErrorMessage (wpc));
+            imported_tag_items = 0;
+            result = WAVPACK_HARD_ERROR;
+        }
+    }
+
+    if (flac_input_mode)
+        FlacCliClose ();
 
     DoCloseHandle (infile);     // we're now done with input file, so close
 
@@ -2597,7 +2627,12 @@ static int pack_audio (WavpackContext *wpc, FILE *infile, int qmode, unsigned ch
             bytes_to_read = (uint32_t) samples_remaining * bytes_per_sample;
 
         samples_remaining -= bytes_to_read / bytes_per_sample;
-        DoReadFile (infile, input_buffer, bytes_to_read, &bytes_read);
+
+        if (flac_input_mode)
+            FlacCliRead (infile, input_buffer, bytes_to_read, &bytes_read);
+        else
+            DoReadFile (infile, input_buffer, bytes_to_read, &bytes_read);
+
         sample_count = bytes_read / bytes_per_sample;
 
         // if we have reordering to do because the user used the --channel-order option to define

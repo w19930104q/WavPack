@@ -20,6 +20,8 @@ EXTRA_DIST = \
 	cmake/wavpackcpu.cmake \
 	\
 	cli/Makefile.w32 \
+	cli/flac-tests/flac_tests.py \
+	cli/flac-tests/run_flac_tests.sh \
 	src/Makefile.os2 \
 	src/Makefile.w32 \
 	src/wavpack.exports \
@@ -58,7 +60,7 @@ if ENABLE_APPS
 bin_PROGRAMS = cli/wavpack cli/wvunpack cli/wvgain cli/wvtag
 endif
 
-cli_wavpack_SOURCES = cli/wavpack.c cli/riff.c cli/wave64.c cli/caff.c cli/dsdiff.c cli/dsf.c cli/aiff.c cli/utils.c cli/md5.c cli/import_id3.c
+cli_wavpack_SOURCES = cli/wavpack.c cli/riff.c cli/wave64.c cli/caff.c cli/dsdiff.c cli/dsf.c cli/aiff.c cli/flac.c cli/utils.c cli/md5.c cli/import_id3.c
 if WINDOWS_HOST
 cli_wavpack_SOURCES += cli/win32_unicode_support.c
 endif
@@ -118,7 +120,7 @@ noinst_HEADERS = \
 ############
 # include/ #
 ############
-pkginclude_HEADERS = include/wavpack.h
+pkginclude_HEADERS = include/wavpack.h include/flacdec.h
 
 ########
 # man/ #
@@ -140,6 +142,7 @@ src_libwavpack_la_SOURCES = \
 	src/entropy_utils.c \
 	src/extra1.c \
 	src/extra2.c \
+	src/flacdec.c \
 	src/open_utils.c \
 	src/open_filename.c \
 	src/open_legacy.c \

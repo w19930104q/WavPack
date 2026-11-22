@@ -19,6 +19,7 @@ PACKSRCS = wavpack.c &
 	caff.c &
 	dsdiff.c &
 	dsf.c &
+	flac.c &
 	aiff.c
 
 UNPACKSRCS = wvunpack.c &

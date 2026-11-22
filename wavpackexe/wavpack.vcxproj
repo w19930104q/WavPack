@@ -201,6 +201,7 @@
     <ClCompile Include="..\cli\caff.c" />
     <ClCompile Include="..\cli\dsdiff.c" />
     <ClCompile Include="..\cli\dsf.c" />
+    <ClCompile Include="..\cli\flac.c" />
     <ClCompile Include="..\cli\import_id3.c" />
     <ClCompile Include="..\cli\md5.c" />
     <ClCompile Include="..\cli\riff.c" />

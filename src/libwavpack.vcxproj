@@ -173,6 +173,7 @@
     <ClCompile Include="entropy_utils.c" />
     <ClCompile Include="extra1.c" />
     <ClCompile Include="extra2.c" />
+    <ClCompile Include="flacdec.c" />
     <ClCompile Include="open_filename.c" />
     <ClCompile Include="open_legacy.c" />
     <ClCompile Include="open_raw.c" />
