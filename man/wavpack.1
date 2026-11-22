@@ -208,7 +208,29 @@ pre-quantize samples to
 depth BEFORE encoding and MD5 calculation
 (common use would be
 .Fl -pre-quantize=20
-for 24-bit or float material recorded with typical converters)
+for 24-bit or float material recorded with typical converters).
+Integer samples are truncated; float samples are always rounded (half up)
+and never clipped.
+.Ar bits
+is measured against the source's container depth
+.Pq bytes-per-sample \(mu 8 ,
+so it can also be used to zero padding bits (e.g.,
+.Fl -pre-quantize=24
+for 24-bit data stored in 4 bytes).
+Values at or above the container depth are a no-op (a warning is issued),
+and the option is ignored (with a warning) for DSD sources.
+The declared bit depth of the resulting file remains that of the source;
+the stored MD5 checksum covers the quantized samples (and therefore matches
+the decoded output, not the original source).
+See
+.Pa doc/pre-quantize.md
+for the exact rounding rules.
+.It Fl -pre-quantize-round= Ns Ar bits
+like
+.Fl -pre-quantize ,
+but round integer samples to the nearest quantum (half up) instead of
+truncating; values that would round past positive full-scale are truncated
+instead
 .It Fl q
 quiet (keep console output to a minimum)
 .It Fl r

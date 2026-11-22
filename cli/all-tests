@@ -1,2 +1,5 @@
 set -e
 ./cli/wvtest --threads --exhaustive
+if [ -x ./cli/wavpack ] || [ -x ./build/wavpack ]; then
+    ./cli/prequantize-tests
+fi

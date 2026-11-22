@@ -20,6 +20,7 @@ EXTRA_DIST = \
 	cmake/wavpackcpu.cmake \
 	\
 	cli/Makefile.w32 \
+	cli/prequantize-tests \
 	src/Makefile.os2 \
 	src/Makefile.w32 \
 	src/wavpack.exports \

@@ -1,0 +1,363 @@
+#!/bin/bash
+# prequantize-tests: end-to-end verification of the --pre-quantize contract
+# documented in doc/pre-quantize.md. For every cell of a hardcoded matrix
+# (input bit depth x pre-quantize bits x rounding -> expected samples and
+# expected MD5) this script encodes a known input, then checks that
+#   1. the decoded samples equal the hardcoded expected samples,
+#   2. the MD5 stored in the WavPack file equals the hardcoded expected MD5,
+#   3. the decoded file still declares the source bit depth,
+#   4. the hardcoded matrix itself matches the documented public rounding
+#      rule applied to the test inputs (guards doc <-> test drift),
+#   5. DSD sources (fresh encode and re-encode) ignore the option with a
+#      warning instead of corrupting the stream.
+#
+# Run from anywhere: ./cli/prequantize-tests
+# Binary locations can be overridden with the WAVPACK and WVUNPACK env vars.
+
+set -e
+here="$(cd "$(dirname "$0")" && pwd)"
+root="$(dirname "$here")"
+
+find_tool () {
+    local varname="$1" prog="$2"
+    if [ -n "${!varname}" ]; then return; fi
+    for cand in "$root/build/$prog" "$root/cli/$prog" "$root/$prog"; do
+        if [ -x "$cand" ]; then eval "$varname=\"$cand\""; return; fi
+    done
+    echo "cannot find $prog; set $varname" >&2
+    exit 1
+}
+
+find_tool WAVPACK wavpack
+find_tool WVUNPACK wvunpack
+export WAVPACK WVUNPACK
+
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "python3 is required for prequantize-tests" >&2
+    exit 1
+fi
+
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+export WORK="$work"
+
+python3 -I - <<'PYEOF'
+import hashlib, math, os, struct, subprocess, sys
+
+WAVPACK = os.environ["WAVPACK"]
+WVUNPACK = os.environ["WVUNPACK"]
+WORK = os.environ["WORK"]
+
+# ---------------------------------------------------------------------------
+# Test inputs: sample values chosen to exercise truncation, round-half-up
+# ties, negative values, and the positive full-scale saturation guard.
+# ---------------------------------------------------------------------------
+
+INPUTS = {
+    8:  [0, 1, 7, 8, 9, 15, 16, 17, -1, -7, -8, -9, -16, -17, 100, 119, 120, 126, 127, -120, -127, -128, 63, 64, -64, -65],
+    16: [0, 1, 255, 256, 511, 512, 513, 4095, 4096, -1, -255, -256, -511, -512, -4096, 32760, 32767, 32766, 32752, -32768, -32767, -32760, 12345, -12345, 20000, -20000],
+    24: [0, 1, 7, 8, 15, 16, 255, 4095, 65535, 65536, -1, -8, -16, -4096, -65536, 8388600, 8388607, 8388592, -8388608, -8388607, 1000000, -1000000, 1234567, -1234567],
+    32: [0, 1, 255, 65535, 65536, 1048575, 16777215, 16777216, -1, -65536, -16777216, 2147483640, 2147483647, 2147483646, -2147483648, -2147483647, 123456789, -123456789, 1000000000, -1000000000],
+    "f32": [0.0, 0.1, -0.1, 0.5, -0.5, 0.999, -0.999, 0.123456789, -0.123456789, 1.0, -1.0, 0.0001, -0.75, 0.33333333],
+}
+
+# ---------------------------------------------------------------------------
+# Hardcoded acceptance matrix:
+#   (input depth, pre-quantize bits, round?) -> expected decoded samples + MD5
+# The MD5 is the value stored in the WavPack stream, which by contract covers
+# the QUANTIZED pcm payload (and therefore matches the decoded output).
+# Every value below was independently computed with the public rounding rule
+# documented in doc/pre-quantize.md (and is re-checked against that rule
+# below, so the matrix, the rule and the implementation cannot drift apart).
+# ---------------------------------------------------------------------------
+
+MATRIX = {
+    (8, 4, False): {
+        "md5": "7946e6cc6d6e61085db7ad0b1b2e3672",
+        "samples": [0, 0, 0, 0, 0, 0, 16, 16, -16, -16, -16, -16, -16, -32, 96, 112, 112, 112, 112, -128, -128, -128, 48, 64, -64, -80],
+    },
+    (8, 4, True): {
+        "md5": "fef4298d655f8fbccc20c613329882b2",
+        "samples": [0, 0, 0, 16, 16, 16, 16, 16, 0, 0, 0, -16, -16, -16, 96, 112, 112, 112, 112, -112, -128, -128, 64, 64, -64, -64],
+    },
+    (8, 6, True): {
+        "md5": "c8b46ed59ec2ce6e7731a5b82e5c429f",
+        "samples": [0, 0, 8, 8, 8, 16, 16, 16, 0, -8, -8, -8, -16, -16, 100, 120, 120, 124, 124, -120, -128, -128, 64, 64, -64, -64],
+    },
+    (8, 8, False): {
+        "md5": "121e5bea7de0c09f78c57d459d0c8848",
+        "samples": [0, 1, 7, 8, 9, 15, 16, 17, -1, -7, -8, -9, -16, -17, 100, 119, 120, 126, 127, -120, -127, -128, 63, 64, -64, -65],
+    },
+    (16, 8, False): {
+        "md5": "75e6d69141f1cc5bcc9b750e2008f4e5",
+        "samples": [0, 0, 0, 256, 256, 512, 512, 3840, 4096, -256, -256, -256, -512, -512, -4096, 32512, 32512, 32512, 32512, -32768, -32768, -32768, 12288, -12544, 19968, -20224],
+    },
+    (16, 12, True): {
+        "md5": "0307bb068106d797ba01cca29ae9b330",
+        "samples": [0, 0, 256, 256, 512, 512, 512, 4096, 4096, 0, -256, -256, -512, -512, -4096, 32752, 32752, 32752, 32752, -32768, -32768, -32752, 12352, -12352, 20000, -20000],
+    },
+    (16, 15, False): {
+        "md5": "60238a3f8ba43f3d66adfd612602a0d1",
+        "samples": [0, 0, 254, 256, 510, 512, 512, 4094, 4096, -2, -256, -256, -512, -512, -4096, 32760, 32766, 32766, 32752, -32768, -32768, -32760, 12344, -12346, 20000, -20000],
+    },
+    (16, 16, False): {
+        "md5": "db2d1157cf657acb33135f91e56265b8",
+        "samples": [0, 1, 255, 256, 511, 512, 513, 4095, 4096, -1, -255, -256, -511, -512, -4096, 32760, 32767, 32766, 32752, -32768, -32767, -32760, 12345, -12345, 20000, -20000],
+    },
+    (24, 16, False): {
+        "md5": "f6e085a7d26e33fd9c48f690b2fb05ed",
+        "samples": [0, 0, 0, 0, 0, 0, 0, 3840, 65280, 65536, -256, -256, -256, -4096, -65536, 8388352, 8388352, 8388352, -8388608, -8388608, 999936, -1000192, 1234432, -1234688],
+    },
+    (24, 20, False): {
+        "md5": "1510df8abe75a5f9d6f6ccafd2fe175d",
+        "samples": [0, 0, 0, 0, 0, 16, 240, 4080, 65520, 65536, -16, -16, -16, -4096, -65536, 8388592, 8388592, 8388592, -8388608, -8388608, 1000000, -1000000, 1234560, -1234576],
+    },
+    (24, 20, True): {
+        "md5": "20fbdc2e887c97eb6e804a58aa31812c",
+        "samples": [0, 0, 0, 16, 16, 16, 256, 4096, 65536, 65536, 0, 0, -16, -4096, -65536, 8388592, 8388592, 8388592, -8388608, -8388608, 1000000, -1000000, 1234560, -1234560],
+    },
+    (24, 24, False): {
+        "md5": "83e8823d4d99c298d1c84d17f07f3a32",
+        "samples": [0, 1, 7, 8, 15, 16, 255, 4095, 65535, 65536, -1, -8, -16, -4096, -65536, 8388600, 8388607, 8388592, -8388608, -8388607, 1000000, -1000000, 1234567, -1234567],
+    },
+    (32, 16, False): {
+        "md5": "2a3ce009c2f62aeb0034b2dadf9209d9",
+        "samples": [0, 0, 0, 0, 65536, 983040, 16711680, 16777216, -65536, -65536, -16777216, 2147418112, 2147418112, 2147418112, -2147483648, -2147483648, 123404288, -123469824, 999948288, -1000013824],
+    },
+    (32, 24, True): {
+        "md5": "6eb3a420928d9196764d2373a49e56cf",
+        "samples": [0, 0, 256, 65536, 65536, 1048576, 16777216, 16777216, 0, -65536, -16777216, 2147483392, 2147483392, 2147483392, -2147483648, -2147483648, 123456768, -123456768, 1000000000, -1000000000],
+    },
+    (32, 31, False): {
+        "md5": "f6c7147fed4b936476134d5d52bfa0a9",
+        "samples": [0, 0, 254, 65534, 65536, 1048574, 16777214, 16777216, -2, -65536, -16777216, 2147483640, 2147483646, 2147483646, -2147483648, -2147483648, 123456788, -123456790, 1000000000, -1000000000],
+    },
+    (32, 32, False): {
+        "md5": "65d2da1a9ea7f459f6eec95725017aa4",
+        "samples": [0, 1, 255, 65535, 65536, 1048575, 16777215, 16777216, -1, -65536, -16777216, 2147483640, 2147483647, 2147483646, -2147483648, -2147483647, 123456789, -123456789, 1000000000, -1000000000],
+    },
+    ("f32", 20, False): {
+        "md5": "8b3cf8035e95fe71af590b13beb97e13",
+        "samples": [0.0, 0.100000381, -0.100000381, 0.5, -0.5, 0.999000549, -0.999000549, 0.123456955, -0.123456955, 1.0, -1.0, 9.9182e-05, -0.75, 0.333333969],
+    },
+    ("f32", 20, True): {
+        "md5": "8b3cf8035e95fe71af590b13beb97e13",
+        "samples": [0.0, 0.100000381, -0.100000381, 0.5, -0.5, 0.999000549, -0.999000549, 0.123456955, -0.123456955, 1.0, -1.0, 9.9182e-05, -0.75, 0.333333969],
+    },
+    ("f32", 24, False): {
+        "md5": "97bc755c5d0b57d024d411f48c06670a",
+        "samples": [0.0, 0.100000024, -0.100000024, 0.5, -0.5, 0.999000072, -0.998999953, 0.123456836, -0.123456836, 1.0, -1.0, 0.000100017, -0.75, 0.333333373],
+    },
+}
+
+# ---------------------------------------------------------------------------
+# The public rounding rule, exactly as documented in doc/pre-quantize.md.
+# This is an INDEPENDENT restatement of the rule (not the C code); the
+# hardcoded matrix above must agree with it, and the implementation must
+# agree with the matrix.
+# ---------------------------------------------------------------------------
+
+def f32(v):
+    return struct.unpack("<f", struct.pack("<f", v))[0]
+
+def public_rule_int(sample, container_bits, q, rnd):
+    if q >= container_bits:
+        return sample                       # no-op: q at or above container depth
+    quantum = 1 << (container_bits - q)
+    s = sample
+    if rnd:
+        offset = quantum >> 1               # round half up ...
+        if s < 0 or s + offset < (1 << (container_bits - 1)):
+            s += offset                     # ... but never past positive full-scale
+    return (s // quantum) * quantum         # floor toward -inf to a quantum multiple
+
+def public_rule_float(f, q, norm_exp=127):
+    f = f32(f)                              # the stored binary32 value is quantized
+    v = math.floor(f * 2.0 ** (q + 126 - norm_exp) + 0.5) * 2.0 ** (norm_exp - 126 - q)
+    return f32(v)                           # always rounds half up, never clips
+
+failures = []
+def check(cond, msg):
+    if not cond:
+        failures.append(msg)
+        print("FAIL: %s" % msg)
+
+# --- step 1: the hardcoded matrix must match the public rule on the inputs --
+
+for (bits, q, rnd), exp in sorted(MATRIX.items(), key=str):
+    src = INPUTS[bits]
+    if bits == "f32":
+        want = [round(public_rule_float(f, q), 9) for f in src]
+    else:
+        want = [public_rule_int(s, bits, q, rnd) for s in src]
+    check(want == exp["samples"],
+          "matrix cell (%s, %d, %s) disagrees with the documented public rule" % (bits, q, rnd))
+
+# ---------------------------------------------------------------------------
+# Helpers to generate inputs and run the tools.
+# ---------------------------------------------------------------------------
+
+def write_wav(path, bits, samples, floatfmt=False, rate=44100, nch=1):
+    data = bytearray()
+    if floatfmt:
+        for s in samples:
+            data += struct.pack("<f", s)
+        fmt, bps = 3, 4
+    else:
+        for s in samples:
+            if bits == 8:
+                data += struct.pack("<B", s + 128)      # 8-bit WAV is unsigned
+            elif bits == 16:
+                data += struct.pack("<h", s)
+            elif bits == 24:
+                data += (s & 0xFFFFFF).to_bytes(3, "little")
+            else:
+                data += struct.pack("<i", s)
+        fmt, bps = 1, (bits + 7) // 8
+    block = nch * bps
+    hdr = b"RIFF" + struct.pack("<I", 36 + len(data)) + b"WAVE"
+    fmtc = b"fmt " + struct.pack("<IHHIIHH", 16, fmt, nch, rate, rate * block, block, bits)
+    with open(path, "wb") as f:
+        f.write(hdr + fmtc + b"data" + struct.pack("<I", len(data)) + data)
+
+def write_dsf(path, payload, rate=2822400):
+    n = len(payload)
+    fmt = b"fmt " + struct.pack("<Q", 52) + struct.pack("<IIII", 1, 0, 1, 1) \
+        + struct.pack("<II", rate, 1) + struct.pack("<QI", n * 8, 4096) + b"\x00" * 4
+    dat = b"data" + struct.pack("<Q", 12 + n) + payload
+    hdr = b"DSD " + struct.pack("<Q", 28) + struct.pack("<Q", 28 + 52 + 12 + n) + struct.pack("<Q", 0)
+    with open(path, "wb") as f:
+        f.write(hdr + fmt + dat)
+
+def run(args):
+    r = subprocess.run(args, capture_output=True, text=True)
+    return r.returncode, r.stdout + r.stderr
+
+def unpack_ints(payload, bits):
+    if bits == 8:
+        return [b - 128 for b in payload]
+    if bits == 16:
+        return list(struct.unpack("<%dh" % (len(payload) // 2), payload))
+    if bits == 24:
+        out = []
+        for i in range(0, len(payload), 3):
+            b = payload[i:i+3]
+            out.append(int.from_bytes(b + (b"\xff" if b[2] & 0x80 else b"\x00"), "little", signed=True))
+        return out
+    return list(struct.unpack("<%di" % (len(payload) // 4), payload))
+
+def stored_md5(wvpath):
+    rc, out = run([WVUNPACK, "-s", wvpath])
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("original md5:"):
+            return line.split()[2]
+    return None
+
+def wav_declared_bits(path):
+    with open(path, "rb") as f:
+        data = f.read(64)
+    i = data.find(b"fmt ")
+    return struct.unpack("<H", data[i + 22:i + 24])[0]
+
+# --- step 2: end-to-end matrix verification (fresh encode -> decode) --------
+
+for (bits, q, rnd), exp in sorted(MATRIX.items(), key=str):
+    name = "in%s" % bits
+    inwav = os.path.join(WORK, "%s.wav" % name)
+    if not os.path.exists(inwav):
+        write_wav(inwav, 32 if bits == "f32" else bits, INPUTS[bits], floatfmt=(bits == "f32"))
+    wv = os.path.join(WORK, "%s_q%d_%d.wv" % (name, q, rnd))
+    opt = "--pre-quantize-round=%d" % q if rnd else "--pre-quantize=%d" % q
+    rc, out = run([WAVPACK, "-y", "-q", "-m", opt, inwav, "-o", wv])
+    check(rc == 0, "encode failed for (%s, %d, %s): %s" % (bits, q, rnd, out.strip()))
+    if rc != 0:
+        continue
+    check(stored_md5(wv) == exp["md5"],
+          "stored MD5 mismatch for (%s, %d, %s): got %s, want %s" % (bits, q, rnd, stored_md5(wv), exp["md5"]))
+    raw = os.path.join(WORK, "out.raw")
+    rc, out = run([WVUNPACK, "-y", "-q", "-r", wv, "-o", raw])
+    check(rc == 0, "decode failed for (%s, %d, %s): %s" % (bits, q, rnd, out.strip()))
+    with open(raw, "rb") as f:
+        payload = f.read()
+    if bits == "f32":
+        got = [round(v, 9) for v in struct.unpack("<%df" % (len(payload) // 4), payload)]
+    else:
+        got = unpack_ints(payload, bits)
+    check(got == exp["samples"],
+          "decoded samples mismatch for (%s, %d, %s): got %r, want %r" % (bits, q, rnd, got, exp["samples"]))
+    # the MD5 stored in the stream must cover the quantized payload, i.e. it
+    # must equal the MD5 of what the decoder actually outputs
+    check(hashlib.md5(payload).hexdigest() == exp["md5"],
+          "stored MD5 does not cover decoded payload for (%s, %d, %s)" % (bits, q, rnd))
+    # lossless verification of the file must pass (MD5 is self-consistent)
+    rc, out = run([WVUNPACK, "-q", "-v", wv])
+    check(rc == 0, "wvunpack -v failed for (%s, %d, %s)" % (bits, q, rnd))
+
+# --- step 3: declared bit depth is unchanged by pre-quantization ------------
+
+for bits, q, rnd in [(8, 4, False), (16, 8, False), (24, 20, False), (32, 16, False)]:
+    name = "in%s" % bits
+    wv = os.path.join(WORK, "%s_q%d_%d.wv" % (name, q, rnd))
+    outwav = os.path.join(WORK, "out.wav")
+    rc, out = run([WVUNPACK, "-y", "-q", wv, "-o", outwav])
+    check(rc == 0 and wav_declared_bits(outwav) == bits,
+          "decoded file declares %d bits, want %d (pre-quantize must not change declared depth)" %
+          (wav_declared_bits(outwav) if rc == 0 else -1, bits))
+
+# --- step 4: re-encoding a .wv source applies the identical rule ------------
+
+src24 = os.path.join(WORK, "in24.wv")
+rc, out = run([WAVPACK, "-y", "-q", "-m", os.path.join(WORK, "in24.wav"), "-o", src24])
+check(rc == 0, "plain 24-bit encode failed: %s" % out.strip())
+rq = os.path.join(WORK, "in24_requant.wv")
+rc, out = run([WAVPACK, "-y", "-q", "--pre-quantize=20", src24, "-o", rq])
+check(rc == 0, "re-encode with --pre-quantize failed: %s" % out.strip())
+exp = MATRIX[(24, 20, False)]
+check(stored_md5(rq) == exp["md5"],
+      "re-encoded MD5 mismatch: got %s, want %s" % (stored_md5(rq), exp["md5"]))
+raw = os.path.join(WORK, "out.raw")
+rc, out = run([WVUNPACK, "-y", "-q", "-r", rq, "-o", raw])
+with open(raw, "rb") as f:
+    got = unpack_ints(f.read(), 24)
+check(got == exp["samples"], "re-encoded samples mismatch: got %r" % (got,))
+
+# --- step 5: no-op cases warn, and DSD is never quantized --------------------
+
+rc, out = run([WAVPACK, "-y", "-q", "--pre-quantize=24", os.path.join(WORK, "in24.wav"), "-o", os.path.join(WORK, "noop.wv")])
+check(rc == 0 and "has no effect" in out, "expected no-op warning for --pre-quantize=24 on 24-bit source")
+
+dsd_payload = bytes((i * 37 + 11) & 0xFF for i in range(4096 * 14))
+dsf = os.path.join(WORK, "t.dsf")
+write_dsf(dsf, dsd_payload)
+raw = os.path.join(WORK, "out.raw")
+# reference: plain encode/decode of the DSD source (bit-exact by definition)
+refwv = os.path.join(WORK, "tref.wv")
+rc, out = run([WAVPACK, "-y", "-q", dsf, "-o", refwv])
+check(rc == 0, "plain DSD encode failed: %s" % out.strip())
+rc, out = run([WVUNPACK, "-y", "-q", "-r", refwv, "-o", raw])
+with open(raw, "rb") as f:
+    dsd_reference = f.read()
+# fresh encode with --pre-quantize: warns, payload untouched
+dwv = os.path.join(WORK, "t.wv")
+rc, out = run([WAVPACK, "-y", "-q", "--pre-quantize=4", dsf, "-o", dwv])
+check(rc == 0 and "not applicable to DSD" in out, "expected DSD warning on fresh encode")
+rc, out = run([WVUNPACK, "-y", "-q", "-r", dwv, "-o", raw])
+with open(raw, "rb") as f:
+    check(f.read() == dsd_reference, "DSD payload altered by --pre-quantize on fresh encode")
+# re-encode with --pre-quantize: warns, payload untouched
+rwv = os.path.join(WORK, "t2.wv")
+rc, out = run([WAVPACK, "-y", "-q", "--pre-quantize=4", dwv, "-o", rwv])
+check(rc == 0 and "not applicable to DSD" in out, "expected DSD warning on re-encode")
+rc, out = run([WVUNPACK, "-y", "-q", "-r", rwv, "-o", raw])
+with open(raw, "rb") as f:
+    check(f.read() == dsd_reference, "DSD payload altered by --pre-quantize on re-encode")
+
+# ---------------------------------------------------------------------------
+
+if failures:
+    print("\n%d pre-quantize check(s) FAILED" % len(failures))
+    sys.exit(1)
+print("all pre-quantize checks passed (%d matrix cells, %d inputs)" %
+      (len(MATRIX), sum(len(v) for v in INPUTS.values())))
+PYEOF

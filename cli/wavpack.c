@@ -225,7 +225,14 @@ static const char *help =
 #endif
 "    --pre-quantize=bits     pre-quantize samples to <bits> BEFORE encoding and MD5\n"
 "                             (common use would be --pre-quantize=20 for 24-bit or\n"
-"                             float material recorded with typical converters)\n"
+"                             float material recorded with typical converters);\n"
+"                             integer samples are truncated, float samples are\n"
+"                             rounded; the stored MD5 and the decoded output\n"
+"                             reflect the quantized samples, while the reported\n"
+"                             bit depth remains that of the source\n"
+"    --pre-quantize-round=bits\n"
+"                            like --pre-quantize, but round integer samples to\n"
+"                             the nearest quantum (half up) instead of truncating\n"
 "    -q                      quiet (keep console output to a minimum)\n"
 "    -r                      parse headers for audio information but do not store in\n"
 "                             WavPack file (minimum header regenerated on unpack)\n"
@@ -2578,6 +2585,9 @@ static int pack_audio (WavpackContext *wpc, FILE *infile, int qmode, unsigned ch
             fquantize_iscale = exp2 (float_norm_exp - 126 - quantize_bits);
         }
     }
+    else if (quantize_bits)
+        error_line ("warning: --pre-quantize=%d has no effect on %d-bit sources, option ignored",
+            quantize_bits, WavpackGetBytesPerSample (wpc) * 8);
 
     // The padding_error_bit_mask now handles both the case of sub-full-byte sample depths
     // (e.g., 12-bit or 20-bit) and the case of unpacked containers (e.g., 24-bit in 4
@@ -2766,6 +2776,9 @@ static int pack_dsd_audio (WavpackContext *wpc, FILE *infile, int qmode, unsigne
     int32_t *sample_buffer;
     unsigned char *input_buffer;
     MD5_CTX md5_context;
+
+    if (quantize_bits)
+        error_line ("warning: --pre-quantize is not applicable to DSD audio, option ignored");
 
     if (md5_digest_source)
         MD5_Init (&md5_context);
@@ -3659,7 +3672,7 @@ static int repack_audio (WavpackContext *outfile, WavpackContext *infile, unsign
     WavpackPackInit (outfile);
     sample_buffer = malloc (input_samples * sizeof (int32_t) * WavpackGetNumChannels (outfile));
 
-    if (quantize_bits && quantize_bits < bps*8) {
+    if (quantize_bits && !(qmode & QMODE_DSD_AUDIO) && quantize_bits < bps*8) {
         quantize_bit_mask = ~((1<<(bps*8-quantize_bits))-1);
         if (MODE_FLOAT == (WavpackGetMode(infile) & MODE_FLOAT)) {
             int float_norm_exp = WavpackGetFloatNormExp (infile);
@@ -3667,6 +3680,11 @@ static int repack_audio (WavpackContext *outfile, WavpackContext *infile, unsign
             fquantize_iscale = exp2 (float_norm_exp - 126 - quantize_bits);
         }
     }
+    else if (quantize_bits && (qmode & QMODE_DSD_AUDIO))
+        error_line ("warning: --pre-quantize is not applicable to DSD audio, option ignored");
+    else if (quantize_bits)
+        error_line ("warning: --pre-quantize=%d has no effect on %d-bit sources, option ignored",
+            quantize_bits, bps * 8);
 
     while (1) {
         uint32_t sample_count = WavpackUnpackSamples (infile, sample_buffer, input_samples);

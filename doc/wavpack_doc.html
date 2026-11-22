@@ -728,7 +728,8 @@ a:hover {
 				</p>
 
 				<p>
-					<b><tt>--pre-quantize=bits = apply pre-quantization to specified bitdepth</tt></b>
+					<b><tt>--pre-quantize=bits = apply pre-quantization to specified bitdepth</tt></b><br>
+					<b><tt>--pre-quantize-round=bits = same, but round (half up) instead of truncating</tt></b>
 				</p>
 				<p>
      Even the finest 24-bits ADCs have a true resolution of only around 20 or 21 bits, and
@@ -750,8 +751,22 @@ a:hover {
      modify the MD5 checksum stored in the file (which WavPack's lossy mode does not do).
 				</p>
 				<p>
+     The precise contract is the following (see <tt>doc/pre-quantize.md</tt> for the
+     normative description). The <i>bits</i> argument is measured against the source's
+     container depth (bytes-per-sample &times; 8), so it can also zero padding bits
+     (e.g., <tt>--pre-quantize=24</tt> for 24-bit data stored in 4 bytes); values at or
+     above the container depth are a no-op and generate a warning. Integer samples are
+     truncated toward &minus;&infin; to a multiple of the quantum, or rounded half up
+     with <tt>--pre-quantize-round</tt> (values that would round past positive full-scale
+     are truncated instead). The declared bit depth of the resulting file remains that of
+     the source &mdash; only the low-order sample bits are modified &mdash; and the stored
+     MD5 checksum covers the <i>quantized</i> samples, so it matches the decoded output
+     rather than the original source file.
+				</p>
+				<p>
 					The pre-quantize option is <b>not</b> usable with DSD audio files because they are
-     already only 1 bit deep, but an error will not be generated (the option is ignored).
+     already only 1 bit deep; the option is ignored and a warning is issued (this applies
+     both to fresh encodes and to re&#235;ncoding existing WavPack DSD files).
 				</p>
 
 				<p>
