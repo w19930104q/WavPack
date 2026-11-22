@@ -1709,8 +1709,8 @@ static int unpack_file (char *infilename, char *outfilename, int add_extension)
             if (output_format == WP_FORMAT_DFF)         // "raw" files are either WAV (for PCM) or DFF (for DSD), but we store
                 output_qmode = QMODE_DSD_MSB_FIRST;     // the raw "qmode" in the file as well (for some future use perhaps?),
             else if (output_format == WP_FORMAT_WAV)    // but we DON'T want to honor that when generating WAV or DFF files
-                output_qmode = 0;                       // because then they would be corrupt (e.g., big-endian WAV files)
-        }
+                output_qmode = input_qmode & QMODE_REORDERED_CHANS;     // because then they would be corrupt (e.g., big-endian
+        }                                                               // WAV files); we do, however, restore any stored channel order
     }
     else if ((!WavpackGetWrapperBytes (wpc) &&          // case 4: unknown format and no wrapper present (and not verify mode),
         outfilename) || skip.value_is_valid ||          //   or just doing a partial file, so we must override to a known format

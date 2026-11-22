@@ -319,6 +319,39 @@ static int num_channels_order;
 static unsigned char channel_order [18];
 static double encode_time_percent;
 
+// Determine whether the channel order specified with --channel-order actually
+// differs from the Microsoft order that WavPack uses internally. The speaker
+// indices are remapped to a dense 0-based permutation (exactly like pack_file()
+// does before reordering) and we simply check whether that is the identity.
+
+static int channel_order_reorders (void)
+{
+    unsigned char dense [18];
+    int i, j;
+
+    for (i = 0; i < num_channels_order; ++i)
+        dense [i] = channel_order [i];
+
+    for (i = 0; i < num_channels_order;) {
+        for (j = 0; j < num_channels_order; ++j)
+            if (dense [j] == i) {
+                i++;
+                break;
+            }
+
+        if (j == num_channels_order)
+            for (j = 0; j < num_channels_order; ++j)
+                if (dense [j] > i)
+                    dense [j]--;
+    }
+
+    for (i = 0; i < num_channels_order; ++i)
+        if (dense [i] != i)
+            return 1;
+
+    return 0;
+}
+
 // These two statics are used to keep track of tags that the user specifies on the
 // command line. The "num_tag_strings" and "tag_strings" fields in the WavpackConfig
 // structure are no longer used for anything (they should not have been there in
@@ -1690,6 +1723,17 @@ static int pack_file (char *infilename, char *outfilename, char *out2filename, c
     CLEAR (wvc_file);
     wpc = WavpackOpenFileOutput (write_block, &wv_file, out2filename ? &wvc_file : NULL);
 
+    // If the user specified a channel order with --channel-order that does not match the
+    // Microsoft order that WavPack uses internally, then the channels will be reordered
+    // for storage and a reordering string will be stored in the file so that the original
+    // order can be restored on decode. Set the qmode bit now, before the configuration is
+    // sent to the library (by the various header parsers below), so that it gets stored
+    // in the file and the MD5 sum is handled correctly (i.e., calculated on the source
+    // channel order, not the reordered one).
+
+    if (num_channels_order && channel_order_reorders ())
+        loc_config.qmode |= QMODE_REORDERED_CHANS;
+
     // open the source file for reading
 
     if (*infilename == '-') {
@@ -2020,8 +2064,9 @@ static int pack_file (char *infilename, char *outfilename, char *out2filename, c
     }
 
     // handle case where the CAF header indicated a channel layout that requires reordering
+    // (not applicable if the user specified a channel order on the command-line)
 
-    if (loc_config.qmode & QMODE_REORDERED_CHANS) {
+    if ((loc_config.qmode & QMODE_REORDERED_CHANS) && !num_channels_order) {
         int layout = WavpackGetChannelLayout (wpc, NULL), i;
 
         if ((layout & 0xff) <= loc_config.num_channels) {
@@ -2071,6 +2116,14 @@ static int pack_file (char *infilename, char *outfilename, char *out2filename, c
                         if (new_channel_order [j] > i)
                             new_channel_order [j]--;
             }
+
+            // if the specified order is not the Microsoft order (the qmode bit was set
+            // earlier when the configuration was sent to the library), then store the
+            // reordering string in the file so that the original channel order can be
+            // restored during decoding
+
+            if (loc_config.qmode & QMODE_REORDERED_CHANS)
+                WavpackSetChannelLayout (wpc, num_channels_order, new_channel_order);
         }
     }
 
@@ -2601,9 +2654,9 @@ static int pack_audio (WavpackContext *wpc, FILE *infile, int qmode, unsigned ch
         sample_count = bytes_read / bytes_per_sample;
 
         // if we have reordering to do because the user used the --channel-order option to define
-        // an order that does not match the Microsoft order, then we do that BEFORE the MD5 because
-        // this reordering is permanent (i.e., we will not unreorder on decode) and we want the
-        // MD5 to match the new order
+        // an order that does not match the Microsoft order, but for some reason the reordering
+        // string is not being stored in the file (so the reordering will be permanent), then we
+        // do that BEFORE the MD5 because we want the MD5 to match the new (stored) order
 
         if (new_order && !(qmode & QMODE_REORDERED_CHANS))
             reorder_channels (input_buffer, new_order, WavpackGetNumChannels (wpc),
@@ -2613,8 +2666,9 @@ static int pack_audio (WavpackContext *wpc, FILE *infile, int qmode, unsigned ch
             MD5_Update (&md5_context, input_buffer, sample_count * bytes_per_sample);
 
         // if we have reordering to do because this is a CAF channel layout that is not in Microsoft
-        // order, then we do the reordering AFTER the MD5 because we will be unreordering them at
-        // decode time, and so we want the MD5 to match the original order
+        // order, or the user specified a non-Microsoft order with --channel-order, then we do the
+        // reordering AFTER the MD5 because we will be unreordering them at decode time, and so we
+        // want the MD5 to match the original order
 
         if (new_order && (qmode & QMODE_REORDERED_CHANS))
             reorder_channels (input_buffer, new_order, WavpackGetNumChannels (wpc),
@@ -2822,9 +2876,9 @@ static int pack_dsd_audio (WavpackContext *wpc, FILE *infile, int qmode, unsigne
             samples_remaining -= sample_count;
 
             // if we have reordering to do because the user used the --channel-order option to define
-            // an order that does not match the Microsoft order, then we do that BEFORE the MD5 because
-            // this reordering is permanent (i.e., we will not unreorder on decode) and we want the
-            // MD5 to match the new order
+            // an order that does not match the Microsoft order, but for some reason the reordering
+            // string is not being stored in the file (so the reordering will be permanent), then we
+            // do that BEFORE the MD5 because we want the MD5 to match the new (stored) order
 
             if (new_order && !(qmode & QMODE_REORDERED_CHANS)) {
                 if (qmode & QMODE_DSD_IN_BLOCKS)
@@ -2835,6 +2889,17 @@ static int pack_dsd_audio (WavpackContext *wpc, FILE *infile, int qmode, unsigne
 
             if (md5_digest_source)
                 MD5_Update (&md5_context, input_buffer, bytes_read);
+
+            // if the reordering string is being stored in the file (so the channels will be
+            // unreordered at decode time), then do the reordering AFTER the MD5 so that the
+            // MD5 matches the original (source) channel order
+
+            if (new_order && (qmode & QMODE_REORDERED_CHANS)) {
+                if (qmode & QMODE_DSD_IN_BLOCKS)
+                    reorder_channels (input_buffer, new_order, num_channels, 1, DSD_BLOCKSIZE);
+                else
+                    reorder_channels (input_buffer, new_order, num_channels, sample_count, 1);
+            }
 
             if (!sample_count) {
                 samples_remaining = 0;
