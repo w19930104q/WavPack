@@ -1,4 +1,4 @@
-.Dd January 16, 2026
+.Dd November 22, 2026
 .Dt WAVPACK 1
 .Os
 .Sh NAME
@@ -286,6 +286,22 @@ yes to all warnings;
 .It Fl z[ Ns Ar n ]
 don't set (n=0 or omitted) or set (n=1) console title
 to indicate progress (leaves "WavPack Completed")
+.El
+.Sh EXIT STATUS
+Each input file in a batch is processed independently:
+a failure on one file is reported but does not abort the remaining files.
+Per-file "[ OK ] / [FAIL]" lines and a final list of the failed
+files (with the failure reasons) are written to standard error.
+.Pp
+The exit status is one of:
+.Bl -tag -width 2 -compact
+.It 0
+every file was processed successfully
+.It 1
+some but not all files failed,
+or a single-file operation or usage error occurred
+.It 2
+every file in a multi-file batch failed
 .El
 .Sh SEE ALSO
 .Xr wvgain 1 ,

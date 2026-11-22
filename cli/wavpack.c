@@ -271,6 +271,13 @@ static const char *help =
 #else
 "    -z1                     set console title to indicate progress\n\n"
 #endif
+" Exit status:\n"
+"    0    all files processed successfully\n"
+"    1    some (but not all) files failed, or a single-file/usage error occurred\n"
+"    2    every file in a multi-file batch failed\n\n"
+"    Each file in a batch is processed independently, so a failure on one file\n"
+"    does not abort the remaining files; per-file [ OK ]/[FAIL] lines and a final\n"
+"    list of failed files (with reasons) are written to standard error.\n\n"
 " Web:\n"
 "     Visit www.wavpack.com for latest version and complete information\n";
 
@@ -370,6 +377,9 @@ int main (int argc, char **argv)
     WavpackConfig config;
     int result, argi, i;
     int warnings = 0;
+    int success_count = 0;
+    char **failed_files = NULL;
+    int num_failed = 0;
 
 #if defined(_WIN32)
     if (!GetModuleFileName (NULL, selfname, sizeof (selfname)))
@@ -1439,15 +1449,29 @@ int main (int argc, char **argv)
             else
                 result = pack_file (matches [file_index], outfilename, out2filename, &config);
 
+            // Each file is processed independently: a failure on one file (including
+            // a hard error) is recorded and reported, but never aborts the remaining
+            // files. Only an explicit user break (Ctrl-C / Ctrl-Break) stops the batch.
+
             if (result != WAVPACK_NO_ERROR) {
                 if (result == WAVPACK_WARNINGS)
                     ++warnings;
-                else
+                else {
                     ++error_count;
+                    failed_files = realloc (failed_files, ++num_failed * sizeof (*failed_files));
+                    failed_files [num_failed - 1] = strdup (matches [file_index]);
+                }
             }
+            else
+                ++success_count;
 
-            if (result == WAVPACK_HARD_ERROR)
-                break;
+            // In quiet mode report failures only; the failure reason itself is
+            // always printed by error_line (), but the [FAIL] marker makes the
+            // per-file outcome explicit and easy to parse.
+
+            if (num_files > 1 && (!quiet_mode || result >= WAVPACK_SOFT_ERROR))
+                fprintf (stderr, "%s %s\n", result == WAVPACK_NO_ERROR || result == WAVPACK_WARNINGS ?
+                    "[ OK ]" : "[FAIL]", matches [file_index]);
 
             // clean up in preparation for potentially another file
 
@@ -1467,15 +1491,21 @@ int main (int argc, char **argv)
         }
 
         if (num_files > 1) {
-            if (warnings || error_count) {
-                fprintf (stderr, "\n");
+            if (error_count) {
+                fprintf (stderr, "\n **** %d of %d files failed, %d processed successfully ****\n",
+                    error_count, num_files, success_count);
 
-                if (error_count)
-                    fprintf (stderr, " **** errors occurred in %d of %d files! ****\n", error_count, num_files);
+                for (i = 0; i < num_failed; ++i)
+                    fprintf (stderr, " ****   failed: %s\n", failed_files [i]);
 
                 if (warnings)
                     fprintf (stderr, " **** warnings occurred in %d of %d files! ****\n", warnings, num_files);
 
+                fflush (stderr);
+            }
+            else if (warnings) {
+                fprintf (stderr, "\n **** %d files processed, warnings occurred in %d! ****\n",
+                    num_files, warnings);
                 fflush (stderr);
             }
             else if (!quiet_mode) {
@@ -1484,6 +1514,10 @@ int main (int argc, char **argv)
             }
         }
 
+        for (i = 0; i < num_failed; ++i)
+            free (failed_files [i]);
+
+        free (failed_files);
         free (matches);
     }
     else {
@@ -1497,7 +1531,13 @@ int main (int argc, char **argv)
     if (set_console_title)
         DoSetConsoleTitle ("WavPack Completed");
 
-    return error_count ? 1 : 0;
+    // Exit status: 0 = every file succeeded; 1 = some files failed (or a usage
+    // error); 2 = every file in a multi-file batch failed.
+
+    if (!error_count)
+        return 0;
+
+    return (num_files > 1 && num_failed == num_files) ? 2 : 1;
 }
 
 #ifdef _WIN32
