@@ -77,4 +77,36 @@ int get_default_worker_threads (void);
 
 #define FN_FIT(fn) ((strlen (fn) > 30) ? filespec_name (fn) : fn)
 
+//////////////////////////////////////////////////////////////////////////////
+// Apple 'chan' chunk (channel layout) support shared by the CAF and AIFF   //
+// command-line modules. The chunk body is a Core Audio AudioChannelLayout  //
+// (big-endian) in both containers.                                         //
+//////////////////////////////////////////////////////////////////////////////
+
+typedef struct {
+    uint32_t mChannelLayoutTag;
+    uint32_t mChannelBitmap;
+    uint32_t mNumberChannelDescriptions;
+} AppleChannelLayout;
+
+#define AppleChannelLayoutFormat "LLL"
+
+typedef struct {
+    uint32_t mChannelLabel;
+    uint32_t mChannelFlags;
+    float mCoordinates [3];
+} AppleChannelDescription;
+
+#define AppleChannelDescriptionFormat "LLLLL"
+
+enum {
+    kAppleChannelLayoutTag_UseChannelDescriptions = (0<<16) | 0,  // use the array of AudioChannelDescriptions to define the mapping.
+    kAppleChannelLayoutTag_UseChannelBitmap = (1<<16) | 0,        // use the bitmap to define the mapping.
+};
+
+int ParseAppleChannelLayout (void *chunk_data, uint32_t chunk_size, WavpackConfig *config,
+    uint32_t *channel_layout, unsigned char **channel_reorder, unsigned char **channel_identities);
+uint32_t AppleChannelLayoutBodySize (WavpackContext *wpc, int qmode);
+int WriteAppleChannelLayoutBody (FILE *outfile, WavpackContext *wpc, int qmode);
+
 #endif

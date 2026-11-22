@@ -66,7 +66,7 @@ static void put_extended (int value, uint16_t *exponent, uint64_t *mantissa)
 
 int WriteAiffHeader (FILE *outfile, WavpackContext *wpc, int64_t total_samples, int qmode)
 {
-    ChunkHeader version_header, common_header, sound_header;
+    ChunkHeader version_header, common_header, chan_header, sound_header;
     uint32_t bcount, timestamp = AIFCVersion1;
     int aifc = 0, common_chunk_size = 18;
     RiffChunkHeader aiff_header;
@@ -79,6 +79,7 @@ int WriteAiffHeader (FILE *outfile, WavpackContext *wpc, int64_t total_samples, 
     int bytes_per_sample = WavpackGetBytesPerSample (wpc);
     int bits_per_sample = WavpackGetBitsPerSample (wpc);
     int float_format = WavpackGetFloatNormExp (wpc);
+    uint32_t chan_body_size = AppleChannelLayoutBodySize (wpc, qmode);
     uint64_t mantissa;
 
     if (float_format) {
@@ -134,6 +135,7 @@ int WriteAiffHeader (FILE *outfile, WavpackContext *wpc, int64_t total_samples, 
 
     total_aiff_bytes = sizeof (aiff_header) + sizeof (common_header) + common_chunk_size + sizeof (sound_header) + sizeof (sound_chunk);
     if (aifc) total_aiff_bytes += sizeof (version_header) + sizeof (timestamp);
+    if (chan_body_size) total_aiff_bytes += sizeof (chan_header) + chan_body_size;    // body sizes are always even
     total_aiff_bytes += (total_data_bytes + 1) & ~(int64_t)1;
 
     memcpy (aiff_header.ckID, "FORM", sizeof (aiff_header.ckID));
@@ -159,11 +161,22 @@ int WriteAiffHeader (FILE *outfile, WavpackContext *wpc, int64_t total_samples, 
     sound_chunk.offset = sound_chunk.blockSize = 0;
     WavpackNativeToBigEndian (&sound_chunk, SoundChunkFormat);
 
+    // if a channel layout is required, format the 'chan' chunk header now; it is
+    // written between the COMM and SSND chunks (the same body as the CAF 'chan' chunk)
+
+    if (chan_body_size) {
+        memcpy (chan_header.ckID, "chan", sizeof (chan_header.ckID));
+        chan_header.ckSize = chan_body_size;
+        WavpackNativeToBigEndian (&chan_header, ChunkHeaderFormat);
+    }
+
     if (!DoWriteFile (outfile, &aiff_header, sizeof (aiff_header), &bcount) || bcount != sizeof (aiff_header)                      ||
         (aifc && (!DoWriteFile (outfile, &version_header, sizeof (version_header), &bcount) || bcount != sizeof (version_header))) ||
         (aifc && (!DoWriteFile (outfile, &timestamp, sizeof (timestamp), &bcount) || bcount != sizeof (timestamp)))                ||
         !DoWriteFile (outfile, &common_header, sizeof (common_header), &bcount) || bcount != sizeof (common_header)                ||
         !DoWriteFile (outfile, &common_chunk, common_chunk_size, &bcount) || bcount != common_chunk_size                           ||
+        (chan_body_size && (!DoWriteFile (outfile, &chan_header, sizeof (chan_header), &bcount) || bcount != sizeof (chan_header))) ||
+        (chan_body_size && !WriteAppleChannelLayoutBody (outfile, wpc, qmode))                                                     ||
         !DoWriteFile (outfile, &sound_header, sizeof (sound_header), &bcount) || bcount != sizeof (sound_header)                   ||
         !DoWriteFile (outfile, &sound_chunk, sizeof (sound_chunk), &bcount) || bcount != sizeof (sound_chunk)) {
             error_line ("can't write .AIF data, disk probably full!");

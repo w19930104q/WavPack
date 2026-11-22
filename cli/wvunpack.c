@@ -1665,6 +1665,8 @@ static int unpack_file (char *infilename, char *outfilename, int add_extension)
             output_qmode = QMODE_DSD_MSB_FIRST;
         else
             output_qmode = 0;
+
+        output_qmode |= input_qmode & QMODE_REORDERED_CHANS;    // raw decode restores the original channel order
     }
     else if (format_specified) {                        // case 2: user specified an output format
         switch (decode_format) {
@@ -1674,7 +1676,7 @@ static int unpack_file (char *infilename, char *outfilename, int add_extension)
                 break;
 
             case WP_FORMAT_AIF:
-                output_qmode = QMODE_SIGNED_BYTES | (aif_le ? 0 : QMODE_BIG_ENDIAN);
+                output_qmode = QMODE_SIGNED_BYTES | (aif_le ? 0 : QMODE_BIG_ENDIAN) | (input_qmode & QMODE_REORDERED_CHANS);
                 output_format = decode_format;
                 break;
 

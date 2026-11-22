@@ -54,13 +54,15 @@ static double get_extended (uint16_t exponent, uint64_t mantissa)
 
 int ParseAiffHeaderConfig (FILE *infile, char *infilename, char *fourcc, WavpackContext *wpc, WavpackConfig *config)
 {
+    uint32_t chan_chunk = 0, channel_layout = 0, bcount;
+    unsigned char *channel_identities = NULL;
+    unsigned char *channel_reorder = NULL;
     int common_chunks = 0, version_chunks = 0;
     int64_t total_samples = 0, infilesize;
     RiffChunkHeader aiff_chunk_header;
     ChunkHeader chunk_header;
     CommonChunk common_chunk;
     SoundChunk sound_chunk;
-    uint32_t bcount;
 
     CLEAR (common_chunk);
     CLEAR (sound_chunk);
@@ -226,15 +228,6 @@ int ParseAiffHeaderConfig (FILE *infile, char *infilename, char *fourcc, Wavpack
             if ((config->qmode & QMODE_EVEN_BYTE_DEPTH) && (config->bits_per_sample % 8))
                 config->bits_per_sample += 8 - (config->bits_per_sample % 8);
 
-            if (!config->channel_mask && !(config->qmode & QMODE_CHANS_UNASSIGNED)) {
-                if (common_chunk.numChannels <= 2)
-                    config->channel_mask = 0x5 - common_chunk.numChannels;
-                else if (common_chunk.numChannels <= 18)
-                    config->channel_mask = (1 << common_chunk.numChannels) - 1;
-                else
-                    config->channel_mask = 0x3ffff;
-            }
-
             // 8-bit AIFF files are normally signed, but this can be overridden by undocumented "raw" compression
 
             if (common_chunk.sampleSize <= 8 && !rawUnsigned)
@@ -253,6 +246,42 @@ int ParseAiffHeaderConfig (FILE *infile, char *infilename, char *fourcc, Wavpack
                     error_line ("data format: %d-bit %s-endian integers stored in %d byte(s)",
                         config->bits_per_sample, (config->qmode & QMODE_BIG_ENDIAN) ? "big" : "little", config->bytes_per_sample);
             }
+        }
+        else if (!strncmp (chunk_header.ckID, "chan", 4)) {         // Apple channel layout chunk (same format as CAF)
+            AppleChannelLayout *apple_channel_layout;
+
+            if (chunk_header.ckSize < sizeof (AppleChannelLayout) || chunk_header.ckSize > 1024) {
+                error_line ("this .AIF%c file has an invalid 'chan' chunk!", aiff_chunk_header.formType [3]);
+                return WAVPACK_SOFT_ERROR;
+            }
+
+            if (debug_logging_mode)
+                error_line ("'chan' chunk is %d bytes", (int) chunk_header.ckSize);
+
+            apple_channel_layout = malloc (padded_chunk_size);
+
+            if (!DoReadFile (infile, apple_channel_layout, padded_chunk_size, &bcount) ||
+                bcount != padded_chunk_size) {
+                    error_line ("%s is not a valid .AIF%c file!", infilename, aiff_chunk_header.formType [3]);
+                    free (apple_channel_layout);
+                    return WAVPACK_SOFT_ERROR;
+            }
+            else if (!(config->qmode & QMODE_NO_STORE_WRAPPER) &&
+                !WavpackAddWrapper (wpc, apple_channel_layout, padded_chunk_size)) {
+                    error_line ("%s", WavpackGetErrorMessage (wpc));
+                    free (apple_channel_layout);
+                    return WAVPACK_SOFT_ERROR;
+            }
+
+            chan_chunk = 1;
+
+            if (ParseAppleChannelLayout (apple_channel_layout, chunk_header.ckSize,
+                config, &channel_layout, &channel_reorder, &channel_identities) == WAVPACK_SOFT_ERROR) {
+                    free (apple_channel_layout);
+                    return WAVPACK_SOFT_ERROR;
+            }
+
+            free (apple_channel_layout);
         }
         else if (!strncmp (chunk_header.ckID, "SSND", 4)) {             // on the data chunk, get size and exit loop
             int64_t data_chunk_size;
@@ -363,9 +392,34 @@ int ParseAiffHeaderConfig (FILE *infile, char *infilename, char *fourcc, Wavpack
         }
     }
 
-    if (!WavpackSetConfiguration64 (wpc, config, total_samples, NULL)) {
+    // if no 'chan' chunk (or command-line channel information) provided a channel
+    // mask, then use the default mask based on the channel count alone
+
+    if (!chan_chunk && !config->channel_mask && !(config->qmode & QMODE_CHANS_UNASSIGNED)) {
+        if (common_chunk.numChannels <= 2)
+            config->channel_mask = 0x5 - common_chunk.numChannels;
+        else if (common_chunk.numChannels <= 18)
+            config->channel_mask = (1 << common_chunk.numChannels) - 1;
+        else
+            config->channel_mask = 0x3ffff;
+    }
+
+    if (!WavpackSetConfiguration64 (wpc, config, total_samples, channel_identities)) {
         error_line ("%s: %s", infilename, WavpackGetErrorMessage (wpc));
         return WAVPACK_SOFT_ERROR;
+    }
+
+    if (channel_identities)
+        free (channel_identities);
+
+    if (channel_layout || channel_reorder) {
+        if (!WavpackSetChannelLayout (wpc, channel_layout, channel_reorder)) {
+            error_line ("problem with setting channel layout (should not happen)");
+            return WAVPACK_SOFT_ERROR;
+        }
+
+        if (channel_reorder)
+            free (channel_reorder);
     }
 
     return WAVPACK_NO_ERROR;
